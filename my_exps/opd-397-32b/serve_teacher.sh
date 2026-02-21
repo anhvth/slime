@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+DEFAULT_UV_PYTHON="${SCRIPT_DIR}/teacher-qwen-35/.venv/bin/python"
+if [[ -x "${DEFAULT_UV_PYTHON}" ]]; then
+  TEACHER_PYTHON="${TEACHER_PYTHON:-${DEFAULT_UV_PYTHON}}"
+else
+  TEACHER_PYTHON="${TEACHER_PYTHON:-python3}"
+fi
+
 DEBUG=0
 if [[ "${1:-}" == "--debug" ]]; then
   DEBUG=1
@@ -40,8 +48,10 @@ if [[ -n "${TEACHER_CONTEXT_LENGTH:-}" ]]; then
   EXTRA_ARGS+=(--context-length "${TEACHER_CONTEXT_LENGTH}")
 fi
 
-exec python3 -m sglang.launch_server \
-  --model-path "${MODEL_PATH}" \
+# fast_sglang stages the model via symlinks so SGLang starts immediately
+# while the real files are copied in the background.
+exec env PYTHONPATH="" "${TEACHER_PYTHON}" "$(command -v fast_sglang)" \
+  "${MODEL_PATH}" \
   --host "${TEACHER_HOST}" \
   --port "${TEACHER_PORT}" \
   "${TEACHER_TP_FLAG}" "${TEACHER_TP}" \

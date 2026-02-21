@@ -1,0 +1,10 @@
+[project]
+name = "teacher-qwen-35"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "sglang[all]",
+]
+
+[tool.uv.sources]
+sglang = { git = "https://github.com/sgl-project/sglang.git", subdirectory = "python" }

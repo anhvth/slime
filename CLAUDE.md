@@ -1,182 +1,141 @@
-# slime — Copilot Workspace Instructions
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
-**slime** is an LLM post-training framework for RL scaling, combining **Megatron-LM** (training) and **SGLang** (inference/rollout) via Ray. Code is edited locally and synced to a remote multi-GPU cluster to run. Do NOT attempt to run training commands locally.
 
-## Key Architecture
-- `train.py` — synchronous training loop (rollout → train → repeat)
-- `train_async.py` — async training loop (rollout and training overlap); required for fully-async examples
-- `slime/` — core library: `ray/`, `rollout/`, `backends/`, `utils/`, `router/`
-- `slime_plugins/` — optional plugins: `megatron_bridge/`, `mbridge/`, `models/`, `rollout_buffer/`
-- `scripts/models/` — MODEL_ARGS shell snippets per model architecture (source these in run scripts)
-- `examples/` — self-contained example directories, each with their own run script(s)
-- `datasets/` — local dataset files (JSONL, parquet); root-level, not inside examples/
+SLIME is an LLM post-training framework for RL (Reinforcement Learning) scaling. It connects Megatron (training) with SGLang (inference) through a Ray-based distributed architecture. SLIME has been used to train GLM-5, GLM-4.7, GLM-4.6, GLM-4.5 and supports Qwen3, DeepSeek V3, and Llama 3 models.
 
-## Argument Categories
-1. **Megatron args** — passed directly (e.g. `--tensor-model-parallel-size 2`)
-2. **SGLang args** — must be prefixed with `--sglang-` (e.g. `--sglang-mem-fraction-static 0.8`)
-3. **slime-specific args** — defined in `slime/utils/arguments.py`
+## Common Commands
 
-## Run Script Conventions
-- Always use `SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"` for relative paths
-- Source the correct model config: `source "${SCRIPT_DIR}/../../scripts/models/<model>.sh"` — this sets `MODEL_ARGS`
-- Dataset path: `"${SCRIPT_DIR}/../../datasets/<name>.jsonl"` (root-level `datasets/`)
-- Checkpoint layout: `--hf-checkpoint` (HF weights) + `--ref-load` (`_torch_dist`) + `--load`/`--save` (`_slime/`)
-- SGLang args passed to rollout engine: prefix with `--sglang-`; engine-count args (e.g. `--rollout-num-gpus-per-engine`) are slime args
-
-## Model Script Notes
-- `qwen3-4B.sh` — base rotary base 1000000
-- `qwen3-4B-Instruct-2507.sh` — sets `MODEL_ARGS_ROTARY_BASE=5000000` then sources `qwen3-4B.sh`; **use this for Qwen3-4B-Instruct-2507 checkpoints**
-
-## GPU / Ray Cluster Layout
-| Mode | Actor (Megatron) | Rollout (SGLang) |
-|---|---|---|
-| Single node 8 GPU | 1 node × 4 GPU | 4 GPU |
-| Multi-node 32 GPU | 3 nodes × 8 GPU | 8 GPU |
-
-- Single-node scripts kill existing processes and call `ray start --head`
-- Multi-node scripts assume the cluster is **already running** — never call `ray start` or `pkill` inside them
-- `MASTER_ADDR` defaults to `127.0.0.1`; override with env var for multi-node
-
-## Scaling Batch Sizes (proportional to GPU count)
-When going from 8→32 GPUs (4×), scale:
-- `--rollout-batch-size`: ×4
-- `--global-batch-size`: ×4
-- TP size can stay at 2 for ≤7B models (within-node, low overhead)
-
-## Fully-Async Pattern (`examples/fully_async/`)
-- Use `train_async.py` (not `train.py`)
-- Set `--rollout-function-path fully_async_rollout.generate_rollout_fully_async`
-- The `PYTHONPATH` in `RUNTIME_ENV_JSON` must include the example directory so `fully_async_rollout` is importable
-- Colocation (`--colocate`) is not supported with `train_async.py`
-
-## Code Style
-- Line length: 119 (black/isort); ruff handles linting
-- Use `pre-commit run --all-files` before committing
-- Python 3.10+ target; type hints encouraged in new code
-- Tests live in `tests/`; run with `pytest`; `examples/` is excluded from test discovery
-
-## Common Pitfalls
-- Wrong model script → wrong rotary base → silent train divergence. Always match checkpoint variant to the right `scripts/models/*.sh`
-- `--sglang-*` prefix missing → SGLang args silently ignored
-- Multi-node script that calls `ray stop` will destroy the shared cluster
-- `PYTHONPATH` in `RUNTIME_ENV_JSON` must include the example dir for custom rollout functions to be importable by Ray workers
-
-## Quick Log Checks
-To find wandb links or other info from remote training logs:
-```bash
-# Find wandb link from latest log
-ssh login-node "cd ~/projects/slime && grep -i 'https://wandb' logs/qwen3-4b-fully-async-32gpu_*/training.log | tail -5"
-
-# Or use ssh-tmux-ctl for interactive inspection
-./ssh-tmux-ctl.sh out <window_name>
-```
-
-## Code Sync Reminder
-ALWAYS sync local code changes to remote before running on the cluster. Use:
-```bash
-rs ./ login-node:/home/anhvth8/projects/slime/
-```
-Where `rs` is the alias for `rsync -av --progress`. This ensures all local changes are propagated to the remote execution environment.
-
-
-
-# Remote Tmux Control (ssh-tmux-ctl)
-
-## Context
-
-We work on a **MacBook** (local). All training runs on a remote GPU cluster reachable as `login-node`.  
-The single self-contained script `ssh-tmux-ctl.sh` lives at the **root of this repo** (`/Users/anhvth/projects/slime/ssh-tmux-ctl.sh`).
-
-**How it works:**
-1. Run the script locally from the MacBook — no manual SSH needed.
-2. On first invocation it `rsync`s itself to `login-node:~/ssh-tmux-ctl.sh`.
-3. It then `ssh`es into `login-node` and re-executes itself there with `_REMOTE_EXEC=1`, which skips the sync step and runs the tmux logic directly.
-4. All tmux work happens inside the **`main`** session only. No split panes — each window has exactly one terminal with a meaningful name.
-
----
-
-## When to Use
-
-- Check what is running on the remote right now → `snap` or `ls`
-- Launch a training job in a named window → `run`
-- Read the output of a running job → `out`
-- Clean up a window → `kill`
-- Any time Copilot needs to inspect or drive `login-node` state — just call the script locally.
-
----
-
-## Script Location & Invocation
+### Training
 
 ```bash
-# Always run from the MacBook, inside the slime repo root:
-./ssh-tmux-ctl.sh <action> [args...]
+# Standard synchronous training (single node, colocated mode)
+python train.py --actor-num-nodes 1 --actor-num-gpus-per-node 8 --colocate ...
+
+# Asynchronous training
+python train_async.py --actor-num-nodes 1 --actor-num-gpus-per-node 8 --colocate ...
+
+# Run example training scripts (refer to scripts/ directory)
+bash scripts/run-qwen3-4B.sh
 ```
 
-The script auto-syncs itself to the remote on every call, so edits made locally are always reflected immediately.
+### Model Conversion
 
----
-
-## Actions
-
-| Action | Args | Description |
-|---|---|---|
-| `snap` | — | Snapshot last 20 lines of every window (default action) |
-| `ls` | — | List all windows with current process name |
-| `run` | `<win_name> "<command>"` | Open (or reuse) a named window and run the command |
-| `out` | `<win_name>` | Print last 50 lines from a window |
-| `kill` | `<win_name>` | Kill a window by name |
-
----
-
-## Common Workflows
-
-### What's running right now?
 ```bash
-./ssh-tmux-ctl.sh snap
-./ssh-tmux-ctl.sh ls
+# Convert HuggingFace to Megatron torch_dist format
+source scripts/models/<model-name>.sh  # Load model config
+PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
+    ${MODEL_ARGS[@]} \
+    --hf-checkpoint /path/to/hf/model \
+    --save /path/to/torch_dist/checkpoint
+
+# Convert Megatron checkpoint back to HuggingFace format
+PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py \
+    --input-dir /path/to/torch_dist/ckpt/iter_xxx/ \
+    --output-dir /path/to/output \
+    --origin-hf-dir /path/to/origin/hf
 ```
 
-### Launch a training job
+### Code Quality
+
 ```bash
-# Sync code first, then launch
-rs ./ login-node:/home/anhvth8/projects/slime/
-./ssh-tmux-ctl.sh run train "cd ~/projects/slime && bash examples/my_exp/run.sh"
+# Run pre-commit hooks (includes Black, isort, ruff)
+pre-commit run --all-files --show-diff-on-failure --color=always
+
+# Manual formatting (line length: 119)
+black slime/
+isort slime/
 ```
 
-### Check job output
+### Testing
+
 ```bash
-./ssh-tmux-ctl.sh out train
+# Run all tests
+pytest
+
+# Run specific test with markers
+pytest -m "unit"              # Unit tests only
+pytest -m "integration"       # Integration tests only
+pytest -m "not skipduringci"  # Exclude CI-skipped tests
+
+# Run a specific test file
+pytest tests/test_qwen3_4B_fsdp.py
 ```
 
-### Kill a window
+## Architecture
+
+### Three-Module Design
+
+1. **Training Module (Megatron/FSDP)**: Main training process, reads from Data Buffer, synchronizes parameters to Rollout
+2. **Rollout Module (SGLang + Router)**: Generates new data with rewards/verifier outputs, stores in Data Buffer
+3. **Data Buffer**: Bridge between training and rollout, manages prompt initialization and custom data
+
+### Key Directories
+
+- `slime/backends/` - Backend implementations (Megatron/FSDP training, SGLang inference)
+- `slime/rollout/` - Data generation with reward model support
+- `slime/ray/` - Ray-based distributed training (actor groups, placement)
+- `slime/router/` - Request routing middleware
+- `slime/utils/` - Utilities including argument parsing, logging, evaluation configs
+- `scripts/models/` - Model configuration files (source these to load MODEL_ARGS)
+- `examples/` - Training patterns (on-policy, multi-agent, tool use, async)
+- `slime_plugins/` - Plugin system for extending functionality
+
+### Argument Categories
+
+1. **Megatron arguments**: Pass directly (e.g., `--tensor-model-parallel-size 2`)
+2. **SGLang arguments**: Prefix with `--sglang-` (e.g., `--sglang-mem-fraction-static 0.7`)
+3. **slime-specific arguments**: See `slime/utils/arguments.py`
+
+### Training Modes
+
+- **Colocated mode** (`--colocate`): Training and inference share GPUs; adjust `--sglang-mem-fraction-static` to avoid OOM (typically 0.7-0.8)
+- **Disaggregated mode**: Separate GPU allocation for `--actor-num-gpus-per-node` and `--rollout-num-gpus`
+
+### Data Flow Constraint
+
+The rollout and training phases must balance: `(rollout-batch-size × n-samples-per-prompt) = (global-batch-size × num-steps-per-rollout)`
+
+## Model Configurations
+
+Model configs are in `scripts/models/*.sh`. Always source the appropriate config before conversion/training:
+
 ```bash
-./ssh-tmux-ctl.sh kill train
+source scripts/models/qwen3-4B.sh  # Sets MODEL_ARGS
+source scripts/models/glm4-9B.sh   # Sets MODEL_ARGS
 ```
 
----
+Verify config parameters match your model version (especially `--rotary-base`).
 
-## Quick Log Checks
-To find wandb links or other info from remote training logs:
-```bash
-# Find wandb link from latest log
-ssh login-node "cd ~/projects/slime && grep -i 'https://wandb' logs/qwen3-4b-fully-async-32gpu_*/training.log | tail -5"
+## Supported Algorithms
 
-# Or use ssh-tmux-ctl for interactive inspection
-./ssh-tmux-ctl.sh out <window_name>
-```
+- GRPO (default)
+- GSPO, Reinforce++, Reinforce++ Baseline, PPO
+- Set via `--advantage-estimator`
 
----
+## Dynamic Batching
 
-## Tips
+Enable `--use-dynamic-batch-size` with `--max-tokens-per-gpu` for efficient token-based batching. This is the recommended approach and does not affect loss calculation.
 
-- **Self-syncing** — every invocation rsyncs the script to remote first; edits are always live.
-- **Named windows only** — never use window indices directly; always use names.
-- **Session `main` is fixed** — do not change it; all remote work lives there.
-- **No interactive SSH** — all operations are single-shot from the MacBook, Copilot-friendly.
-- **Re-use existing windows** — `run` on an already-open window sends the command into it rather than opening a new one.
-- **ALWAYS** use remote enviroment:
-  - Examples: 
-    User ask to find an output file then use ssh-tmux-ctl as starting point
-    User ask where is the output dir: translate it to: I need to find the output dir on the remote cluster!
-       - Check log of currently training job 
+## Custom Extensions
+
+For multi-turn or tool-use scenarios:
+1. Prepare data with a `metadata` column containing JSON-structured additional info
+2. Implement custom generate function: `async def generate(args, sample: Sample, sampling_params) -> Sample`
+3. Implement custom reward function: `async def reward_func(args, sample: Sample, **kwargs) -> float`
+4. Configure via `--custom-generate-function-path` and `--custom-rm-path`
+
+## Hardware Support
+
+- **B200/H-series**: Supported via Docker image `slimerl/slime:latest`
+- **AMD**: Refer to `docs/en/platform_support/amd_tutorial.md`
+- H-series has CI coverage; B-series is stable but lacks CI protection
+
+## Development Tips
+
+- For debugging, see `docs/en/developer_guide/debug.md`
+- For profiling, see `docs/en/developer_guide/profiling.md`
+- Use `PYTHONBUFFERED=16` to prevent Ray from buffering stdout/stderr
+- For multi-node training, start Ray cluster first: `ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8`
