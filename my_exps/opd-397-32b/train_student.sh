@@ -68,6 +68,11 @@ if [[ ! -f "${TRAIN_PY_PATH}" ]]; then
   exit 1
 fi
 
+OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs/opd-397-32b}"
+STUDENT_LOAD_PATH="${STUDENT_LOAD:-${OUTPUT_ROOT}/student_sync}"
+STUDENT_SAVE_PATH="${STUDENT_SAVE:-${OUTPUT_ROOT}/student_sync}"
+mkdir -p "${OUTPUT_ROOT}"
+
 
 TEACHER_HOST="${TEACHER_HOST:-worker-15}"
 TEACHER_PORT="${TEACHER_PORT:-13141}"
@@ -93,8 +98,8 @@ fi
 CKPT_ARGS=(
   --hf-checkpoint "${STUDENT_HF_CHECKPOINT_PATH}"
   --ref-load "${STUDENT_REF_LOAD_PATH}"
-  --load "${STUDENT_LOAD:-${STUDENT_HF_DEFAULT}_slime}"
-  --save "${STUDENT_SAVE:-${STUDENT_HF_DEFAULT}_slime}"
+  --load "${STUDENT_LOAD_PATH}"
+  --save "${STUDENT_SAVE_PATH}"
   --save-interval "${SAVE_INTERVAL:-20}"
 )
 
@@ -106,9 +111,10 @@ ROLLOUT_ARGS=(
   --num-rollout "${NUM_ROLLOUT:-300}"
   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-24}"
   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-4}"
-  --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
+  --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-2048}"
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
   --global-batch-size "${GLOBAL_BATCH_SIZE:-96}"
+  --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-5}"
   --balance-data
 )
 
