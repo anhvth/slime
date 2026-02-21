@@ -21,17 +21,58 @@ MODEL_HOME="${MODEL_HOME:-$HOME/ckpt/hf_models/Qwen}"
 DATA_HOME="${DATA_HOME:-$HOME/ckpt}"
 
 if [[ ${DEBUG} -eq 1 ]]; then
-  STUDENT_NAME="Qwen3-4B"
-  source "${REPO_ROOT}/scripts/models/qwen3-4B.sh"
+  MODEL_CONFIG_SCRIPT="${REPO_ROOT}/scripts/models/qwen3-4B-as-qwen35.sh"
+  source "${MODEL_CONFIG_SCRIPT}"
+  STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT:-/home/anhvth8/ckpt/hf_models/Qwen/Qwen3-4B-As-Qwen35}"
 else
-  STUDENT_NAME="Qwen3-32B"
-  source "${REPO_ROOT}/scripts/models/qwen3-32B.sh"
+  MODEL_CONFIG_SCRIPT="${REPO_ROOT}/scripts/models/qwen3-32B-as-qwen35.sh"
+  source "${MODEL_CONFIG_SCRIPT}"
+  STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT:-/home/anhvth8/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35}"
 fi
 
-TEACHER_HOST="${TEACHER_HOST:-127.0.0.1}"
+STUDENT_HF_CHECKPOINT_PATH="${STUDENT_HF_CHECKPOINT:-${STUDENT_HF_DEFAULT}}"
+if [[ -n "${STUDENT_REF_LOAD:-}" ]]; then
+  STUDENT_REF_LOAD_PATH="${STUDENT_REF_LOAD}"
+else
+  STUDENT_REF_LOAD_PATH="${STUDENT_HF_DEFAULT}_torch_dist"
+  if [[ ${DEBUG} -eq 1 && ! -e "${STUDENT_REF_LOAD_PATH}" ]]; then
+    # In debug, converted HF weights often reuse the original Qwen3-4B torch_dist reference path.
+    DEBUG_REF_FALLBACK="${MODEL_HOME}/Qwen3-4B_torch_dist"
+    if [[ -e "${DEBUG_REF_FALLBACK}" ]]; then
+      STUDENT_REF_LOAD_PATH="${DEBUG_REF_FALLBACK}"
+      echo "Using debug ref-load fallback: ${STUDENT_REF_LOAD_PATH}"
+    fi
+  fi
+fi
+DEBUG_FLAG=""
+if [[ ${DEBUG} -eq 1 ]]; then
+  DEBUG_FLAG=" --debug"
+fi
+
+if [[ ! -e "${STUDENT_HF_CHECKPOINT_PATH}" ]]; then
+  echo "Missing student HF checkpoint path: ${STUDENT_HF_CHECKPOINT_PATH}" >&2
+  echo "Use tools/convert_torch_dist_to_hf.py first if you only have torch_dist checkpoints." >&2
+  exit 1
+fi
+if [[ ! -e "${STUDENT_REF_LOAD_PATH}" ]]; then
+  echo "Missing student ref-load path: ${STUDENT_REF_LOAD_PATH}" >&2
+  echo "Run this exact command to build it:" >&2
+  echo "source ${MODEL_CONFIG_SCRIPT} && PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \${MODEL_ARGS[@]} --hf-checkpoint \"${STUDENT_HF_CHECKPOINT_PATH}\" --save \"${STUDENT_REF_LOAD_PATH}\"" >&2
+  echo "Or override with an existing path: STUDENT_REF_LOAD=/path/to/torch_dist bash $0${DEBUG_FLAG}" >&2
+  exit 1
+fi
+
+TRAIN_PY_PATH="${TRAIN_PY_PATH:-${REPO_ROOT}/train.py}"
+if [[ ! -f "${TRAIN_PY_PATH}" ]]; then
+  echo "Missing train entrypoint: ${TRAIN_PY_PATH}" >&2
+  exit 1
+fi
+
+
+TEACHER_HOST="${TEACHER_HOST:-worker-15}"
 TEACHER_PORT="${TEACHER_PORT:-13141}"
 TEACHER_URL="${TEACHER_URL:-http://${TEACHER_HOST}:${TEACHER_PORT}/generate}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://127.0.0.1:${RAY_DASHBOARD_PORT:-8265}}"
 
 TEACHER_BASE="${TEACHER_URL%/generate}"
 if [[ "${TEACHER_BASE}" == "${TEACHER_URL}" ]]; then
@@ -50,15 +91,15 @@ else
 fi
 
 CKPT_ARGS=(
-  --hf-checkpoint "${STUDENT_HF_CHECKPOINT:-${MODEL_HOME}/${STUDENT_NAME}}"
-  --ref-load "${STUDENT_REF_LOAD:-${MODEL_HOME}/${STUDENT_NAME}_torch_dist}"
-  --load "${STUDENT_LOAD:-${MODEL_HOME}/${STUDENT_NAME}_slime}"
-  --save "${STUDENT_SAVE:-${MODEL_HOME}/${STUDENT_NAME}_slime}"
+  --hf-checkpoint "${STUDENT_HF_CHECKPOINT_PATH}"
+  --ref-load "${STUDENT_REF_LOAD_PATH}"
+  --load "${STUDENT_LOAD:-${STUDENT_HF_DEFAULT}_slime}"
+  --save "${STUDENT_SAVE:-${STUDENT_HF_DEFAULT}_slime}"
   --save-interval "${SAVE_INTERVAL:-20}"
 )
 
 ROLLOUT_ARGS=(
-  --prompt-data "${PROMPT_DATA:-${DATA_HOME}/dapo-math-17k/dapo-math-17k.jsonl}"
+  --prompt-data "${PROMPT_DATA:-${REPO_ROOT}/datasets/dapo-math-17k.jsonl}"
   --input-key "${INPUT_KEY:-prompt}"
   --apply-chat-template
   --rollout-shuffle
@@ -142,9 +183,6 @@ MISC_ARGS=(
   --attention-backend flash
 )
 
-ray stop --force >/dev/null 2>&1 || true
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${RAY_NUM_GPUS:-8}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port "${RAY_DASHBOARD_PORT:-8265}"
-
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"${MEGATRON_PYTHONPATH:-/root/Megatron-LM/}\",
@@ -159,9 +197,9 @@ LAYOUT_ARGS=(
   --colocate
 )
 
-ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT:-8265}" \
+ray job submit --address="${RAY_JOB_ADDRESS}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- python3 train.py \
+  -- python3 "${TRAIN_PY_PATH}" \
   "${LAYOUT_ARGS[@]}" \
   "${MODEL_ARGS[@]}" \
   "${CKPT_ARGS[@]}" \
