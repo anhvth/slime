@@ -37,7 +37,7 @@ else
   STUDENT_REF_LOAD_PATH="${STUDENT_HF_DEFAULT}_torch_dist"
   if [[ ${DEBUG} -eq 1 && ! -e "${STUDENT_REF_LOAD_PATH}" ]]; then
     # In debug, converted HF weights often reuse the original Qwen3-4B torch_dist reference path.
-    DEBUG_REF_FALLBACK="${MODEL_HOME}/Qwen3-4B_torch_dist"
+    DEBUG_REF_FALLBACK="${MODEL_HOME}/Qwen3-4B-As-Qwen35_torch_dist"
     if [[ -e "${DEBUG_REF_FALLBACK}" ]]; then
       STUDENT_REF_LOAD_PATH="${DEBUG_REF_FALLBACK}"
       echo "Using debug ref-load fallback: ${STUDENT_REF_LOAD_PATH}"
@@ -104,11 +104,11 @@ ROLLOUT_ARGS=(
   --apply-chat-template
   --rollout-shuffle
   --num-rollout "${NUM_ROLLOUT:-300}"
-  --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-16}"
+  --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-24}"
   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-4}"
   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
-  --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
+  --global-batch-size "${GLOBAL_BATCH_SIZE:-96}"
   --balance-data
 )
 
@@ -175,6 +175,31 @@ for bs in $(seq 16 8 "${SGLANG_CUDA_GRAPH_BS_MAX:-256}"); do
   SGLANG_ARGS+=("${bs}")
 done
 
+WANDB_GROUP_DEFAULT="opd-397-32b-student"
+if [[ ${DEBUG} -eq 1 ]]; then
+  WANDB_GROUP_DEFAULT="${WANDB_GROUP_DEFAULT}-debug"
+fi
+
+WANDB_ARGS=(
+  --use-wandb
+  --wandb-project "${WANDB_PROJECT:-slime-opd}"
+  --wandb-group "${WANDB_GROUP:-${WANDB_GROUP_DEFAULT}}"
+)
+
+WANDB_KEY_VALUE="${WANDB_KEY:-${WANDB_API_KEY:-}}"
+if [[ -n "${WANDB_KEY_VALUE}" ]]; then
+  WANDB_ARGS+=(--wandb-key "${WANDB_KEY_VALUE}")
+fi
+if [[ -n "${WANDB_HOST:-}" ]]; then
+  WANDB_ARGS+=(--wandb-host "${WANDB_HOST}")
+fi
+if [[ -n "${WANDB_TEAM:-}" ]]; then
+  WANDB_ARGS+=(--wandb-team "${WANDB_TEAM}")
+fi
+if [[ "${WANDB_DISABLE_RANDOM_SUFFIX:-0}" == "1" ]]; then
+  WANDB_ARGS+=(--disable-wandb-random-suffix)
+fi
+
 MISC_ARGS=(
   --attention-dropout 0.0
   --hidden-dropout 0.0
@@ -192,10 +217,19 @@ RUNTIME_ENV_JSON="{
 }"
 
 LAYOUT_ARGS=(
-  --actor-num-nodes "${ACTOR_NUM_NODES:-1}"
+  --actor-num-nodes "${ACTOR_NUM_NODES:-3}"
   --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE:-8}"
   --colocate
 )
+
+LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
+mkdir -p "${LOG_DIR}"
+RUN_NAME="train_student"
+if [[ ${DEBUG} -eq 1 ]]; then
+  RUN_NAME="${RUN_NAME}_debug"
+fi
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log}"
+echo "Tee logging to: ${LOG_FILE}"
 
 ray job submit --address="${RAY_JOB_ADDRESS}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
@@ -209,5 +243,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   "${PERF_ARGS[@]}" \
   "${EVAL_ARGS[@]}" \
   "${SGLANG_ARGS[@]}" \
+  "${WANDB_ARGS[@]}" \
   "${MISC_ARGS[@]}" \
-  "${RM_ARGS[@]}"
+  "${RM_ARGS[@]}" \
+  2>&1 | tee -a "${LOG_FILE}"

@@ -36,6 +36,41 @@ __all__ = ["generate_rollout"]
 logger = logging.getLogger(__name__)
 
 
+def _truncate_for_log(value: Any, max_depth: int = 4, max_list_items: int = 8, max_str_len: int = 512) -> Any:
+    """Keep original structure but trim oversized fields for readable logs."""
+    if max_depth <= 0:
+        return f"<{type(value).__name__}>"
+
+    if isinstance(value, str):
+        if len(value) <= max_str_len:
+            return value
+        half = max(1, max_str_len // 2)
+        return f"{value[:half]} ... <truncated {len(value) - 2 * half} chars> ... {value[-half:]}"
+
+    if isinstance(value, list):
+        n = len(value)
+        if n <= max_list_items:
+            return [_truncate_for_log(v, max_depth - 1, max_list_items, max_str_len) for v in value]
+        head_n = max(1, max_list_items // 2)
+        tail_n = max(1, max_list_items - head_n)
+        head = [_truncate_for_log(v, max_depth - 1, max_list_items, max_str_len) for v in value[:head_n]]
+        tail = [_truncate_for_log(v, max_depth - 1, max_list_items, max_str_len) for v in value[-tail_n:]]
+        omitted = n - head_n - tail_n
+        return head + [f"... <{omitted} items truncated, total={n}> ..."] + tail
+
+    if isinstance(value, tuple):
+        return tuple(_truncate_for_log(v, max_depth - 1, max_list_items, max_str_len) for v in value)
+
+    if isinstance(value, dict):
+        return {k: _truncate_for_log(v, max_depth - 1, max_list_items, max_str_len) for k, v in value.items()}
+
+    return value
+
+
+def _summarize_reward_for_log(reward: Any) -> Any:
+    return _truncate_for_log(reward)
+
+
 class GenerateState(metaclass=SingletonMeta):
     """
     The global state for the generation process.
@@ -391,7 +426,8 @@ async def generate_rollout_async(
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
+                    f"label: {str(sample.label)[:100]}, reward: {_summarize_reward_for_log(sample.reward)}",
                 )
                 do_print = False
 
@@ -412,7 +448,8 @@ async def generate_rollout_async(
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
+        f"label: {str(sample.label)[:100]}, reward: {_summarize_reward_for_log(sample.reward)}",
     )
 
     # there are still some unfinished requests, abort them
@@ -534,7 +571,7 @@ async def eval_rollout_single_dataset(
             logger.info(
                 "eval_rollout_single_dataset example data: "
                 f"{[str(sample.prompt) + sample.response]} "
-                f"reward={sample.reward}"
+                f"reward={_summarize_reward_for_log(sample.reward)}"
             )
             do_print = False
         if isinstance(sample, list):
