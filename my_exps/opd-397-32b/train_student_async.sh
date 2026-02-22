@@ -15,6 +15,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 cd "${REPO_ROOT}"
 
+mkdir -p "${SCRIPT_DIR}/logs"
+LOG_FILE="${SCRIPT_DIR}/logs/training_async_active.log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+echo "===== $(date '+%Y-%m-%d %H:%M:%S') train_student_async start ====="
+
 export PYTHONBUFFERED=1
 if [[ ${DEBUG} -eq 1 ]]; then
   source "${REPO_ROOT}/scripts/models/qwen3-4B-as-qwen35.sh"
@@ -31,7 +36,14 @@ STUDENT_HF_CHECKPOINT_PATH="${STUDENT_HF_CHECKPOINT:-${STUDENT_HF_DEFAULT}}"
 STUDENT_REF_LOAD_PATH="${STUDENT_REF_LOAD:-${STUDENT_HF_CHECKPOINT_PATH}_torch_dist}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs/opd-397-32b}"
 STUDENT_SAVE_PATH="${STUDENT_SAVE:-${OUTPUT_ROOT}/student_async}"
-STUDENT_LOAD_PATH="${STUDENT_LOAD:-${STUDENT_SAVE_PATH}}"
+RESUME_FROM_SAVE="${RESUME_FROM_SAVE:-0}"
+if [[ -n "${STUDENT_LOAD:-}" ]]; then
+  STUDENT_LOAD_PATH="${STUDENT_LOAD}"
+elif [[ "${RESUME_FROM_SAVE}" == "1" ]]; then
+  STUDENT_LOAD_PATH="${STUDENT_SAVE_PATH}"
+else
+  STUDENT_LOAD_PATH=""
+fi
 mkdir -p "${OUTPUT_ROOT}"
 
 [[ -e "${STUDENT_HF_CHECKPOINT_PATH}" ]] || {
@@ -43,7 +55,44 @@ mkdir -p "${OUTPUT_ROOT}"
   exit 1
 }
 
-TEACHER_HOST="${TEACHER_HOST:-worker-15}"
+MAX_CHECKPOINTS_TO_KEEP="${MAX_CHECKPOINTS_TO_KEEP:-5}"
+CHECKPOINT_PRUNE_INTERVAL_SEC="${CHECKPOINT_PRUNE_INTERVAL_SEC:-300}"
+
+prune_old_checkpoints() {
+  local ckpt_root="$1"
+  local keep_n="$2"
+  [[ -d "${ckpt_root}" ]] || return 0
+  [[ "${keep_n}" -gt 0 ]] || return 0
+
+  local ckpts=()
+  mapfile -t ckpts < <(find "${ckpt_root}" -maxdepth 1 -mindepth 1 -type d -name 'iter_[0-9][0-9][0-9][0-9][0-9][0-9][0-9]' | sort)
+  local count="${#ckpts[@]}"
+  (( count > keep_n )) || return 0
+
+  local delete_n=$((count - keep_n))
+  for ((i = 0; i < delete_n; i++)); do
+    rm -rf -- "${ckpts[$i]}"
+  done
+}
+
+start_checkpoint_pruner() {
+  [[ "${MAX_CHECKPOINTS_TO_KEEP}" -gt 0 ]] || return 0
+  (
+    while true; do
+      prune_old_checkpoints "${STUDENT_SAVE_PATH}" "${MAX_CHECKPOINTS_TO_KEEP}" || true
+      sleep "${CHECKPOINT_PRUNE_INTERVAL_SEC}"
+    done
+  ) &
+  CKPT_PRUNER_PID=$!
+}
+
+stop_checkpoint_pruner() {
+  if [[ -n "${CKPT_PRUNER_PID:-}" ]]; then
+    kill "${CKPT_PRUNER_PID}" >/dev/null 2>&1 || true
+  fi
+}
+
+TEACHER_HOST="${TEACHER_HOST:-worker-29}"
 TEACHER_PORT="${TEACHER_PORT:-13141}"
 TEACHER_URL="${TEACHER_URL:-http://${TEACHER_HOST}:${TEACHER_PORT}/generate}"
 TEACHER_BASE="${TEACHER_URL%/generate}"
@@ -54,10 +103,10 @@ curl -sf "${TEACHER_BASE}/get_model_info" >/dev/null
 
 RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://127.0.0.1:${RAY_DASHBOARD_PORT:-8265}}"
 
-# Opinionated async layout for a 24-GPU cluster: 8 train + 16 rollout.
-ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
+# Opinionated async layout for a 56-GPU cluster: 24 train (3 nodes) + 32 rollout (4 nodes).
+ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-3}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
-ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-16}"
+ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-32}"
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-8}"
 
 TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-8}"
@@ -68,20 +117,101 @@ WORLD_SIZE=$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))
 }
 DP_SIZE=$((WORLD_SIZE / TENSOR_MODEL_PARALLEL_SIZE))
 
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-24}"
+BASE_PROMPTS_PER_DP="${BASE_PROMPTS_PER_DP:-8}"
+if [[ -z "${ROLLOUT_BATCH_SIZE:-}" ]]; then
+  ROLLOUT_BATCH_SIZE=$((BASE_PROMPTS_PER_DP * DP_SIZE))
+fi
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-96}"
+if [[ -z "${GLOBAL_BATCH_SIZE:-}" ]]; then
+  GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
+fi
+TARGET_PROMPTS="${TARGET_PROMPTS:-200000}"
+
+gcd() {
+  local a="$1"
+  local b="$2"
+  while (( b != 0 )); do
+    local t="$b"
+    b=$((a % b))
+    a="$t"
+  done
+  echo "$a"
+}
+
+# Opinionated async script enforces:
+# 1) rollout_batch_size * n_samples_per_prompt == global_batch_size
+# 2) global_batch_size divisible by dp_size
+# Auto-correct to nearest valid rollout batch granularity if needed.
+GCD_DP_NSAMPLES="$(gcd "${DP_SIZE}" "${N_SAMPLES_PER_PROMPT}")"
+ROLLOUT_BATCH_GRANULARITY=$((DP_SIZE / GCD_DP_NSAMPLES))
+if (( ROLLOUT_BATCH_SIZE % ROLLOUT_BATCH_GRANULARITY != 0 )); then
+  RAW_ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE}"
+  ROLLOUT_BATCH_SIZE=$(( (ROLLOUT_BATCH_SIZE / ROLLOUT_BATCH_GRANULARITY) * ROLLOUT_BATCH_GRANULARITY ))
+  (( ROLLOUT_BATCH_SIZE > 0 )) || ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_GRANULARITY}"
+  echo "Adjust rollout_batch_size ${RAW_ROLLOUT_BATCH_SIZE} -> ${ROLLOUT_BATCH_SIZE} (granularity=${ROLLOUT_BATCH_GRANULARITY} for dp_size=${DP_SIZE}, n_samples_per_prompt=${N_SAMPLES_PER_PROMPT})"
+fi
 TOTAL_SAMPLES=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
+if (( GLOBAL_BATCH_SIZE != TOTAL_SAMPLES )); then
+  echo "Adjust global_batch_size ${GLOBAL_BATCH_SIZE} -> ${TOTAL_SAMPLES} to satisfy one train step per rollout"
+  GLOBAL_BATCH_SIZE="${TOTAL_SAMPLES}"
+fi
 (( GLOBAL_BATCH_SIZE % DP_SIZE == 0 )) || {
-  echo "Invalid batching: global_batch_size=${GLOBAL_BATCH_SIZE} not divisible by dp_size=${DP_SIZE}" >&2
+  echo "Invalid batching after auto-adjust: global_batch_size=${GLOBAL_BATCH_SIZE} not divisible by dp_size=${DP_SIZE}" >&2
   exit 1
 }
-(( TOTAL_SAMPLES == GLOBAL_BATCH_SIZE )) || {
-  echo "Opinionated async script expects one train step per rollout:" >&2
-  echo "  rollout_batch_size*n_samples_per_prompt=${TOTAL_SAMPLES} != global_batch_size=${GLOBAL_BATCH_SIZE}" >&2
-  echo "Override ROLLOUT_BATCH_SIZE/N_SAMPLES_PER_PROMPT/GLOBAL_BATCH_SIZE to match." >&2
+NUM_ROLLOUT_DEFAULT=$(((TARGET_PROMPTS + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE))
+
+detect_rollout_context_len() {
+  local hf_path="$1"
+  local config_path="${hf_path%/}/config.json"
+  [[ -f "${config_path}" ]] || return 1
+
+  local context_len=""
+  context_len="$(awk -F: '/"max_position_embeddings"[[:space:]]*:/ {gsub(/[^0-9]/, "", $2); if (length($2) > 0) {print $2; exit}}' "${config_path}")"
+  if [[ -z "${context_len}" ]]; then
+    context_len="$(awk -F: '/"model_max_length"[[:space:]]*:/ {gsub(/[^0-9]/, "", $2); if (length($2) > 0) {print $2; exit}}' "${config_path}")"
+  fi
+
+  [[ -n "${context_len}" ]] || return 1
+  echo "${context_len}"
+}
+
+ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-2048}"
+if [[ -z "${ROLLOUT_MAX_CONTEXT_LEN:-}" ]]; then
+  ROLLOUT_MAX_CONTEXT_LEN="$(detect_rollout_context_len "${STUDENT_HF_CHECKPOINT_PATH}" || true)"
+fi
+[[ -n "${ROLLOUT_MAX_CONTEXT_LEN:-}" ]] || {
+  echo "Unable to determine ROLLOUT_MAX_CONTEXT_LEN from ${STUDENT_HF_CHECKPOINT_PATH}/config.json." >&2
+  echo "Set ROLLOUT_MAX_CONTEXT_LEN explicitly." >&2
   exit 1
 }
+if [[ -z "${ROLLOUT_MAX_PROMPT_LEN:-}" ]]; then
+  ROLLOUT_MAX_PROMPT_LEN=$((ROLLOUT_MAX_CONTEXT_LEN - ROLLOUT_MAX_RESPONSE_LEN))
+fi
+
+for len_var in ROLLOUT_MAX_CONTEXT_LEN ROLLOUT_MAX_PROMPT_LEN ROLLOUT_MAX_RESPONSE_LEN; do
+  [[ "${!len_var}" =~ ^[0-9]+$ ]] || {
+    echo "${len_var} must be a positive integer, got '${!len_var}'" >&2
+    exit 1
+  }
+done
+(( ROLLOUT_MAX_PROMPT_LEN > 0 )) || {
+  echo "ROLLOUT_MAX_PROMPT_LEN must be > 0, got ${ROLLOUT_MAX_PROMPT_LEN}" >&2
+  exit 1
+}
+(( ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN <= ROLLOUT_MAX_CONTEXT_LEN )) || {
+  echo "Invalid rollout length limits:" >&2
+  echo "  rollout_max_prompt_len(${ROLLOUT_MAX_PROMPT_LEN}) + rollout_max_response_len(${ROLLOUT_MAX_RESPONSE_LEN})" >&2
+  echo "  exceeds rollout_max_context_len(${ROLLOUT_MAX_CONTEXT_LEN})" >&2
+  exit 1
+}
+echo "Rollout length limits: context=${ROLLOUT_MAX_CONTEXT_LEN}, prompt<=${ROLLOUT_MAX_PROMPT_LEN}, response<=${ROLLOUT_MAX_RESPONSE_LEN}"
+
+LR="${LR:-5e-7}"
+LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-20}"
+CLIP_GRAD="${CLIP_GRAD:-0.5}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-12288}"
+ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.95}"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=0
@@ -95,6 +225,14 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
+start_checkpoint_pruner
+trap stop_checkpoint_pruner EXIT
+
+LOAD_ARGS=()
+if [[ -n "${STUDENT_LOAD_PATH}" ]]; then
+  LOAD_ARGS+=(--load "${STUDENT_LOAD_PATH}")
+fi
+
 ray job submit --address="${RAY_JOB_ADDRESS}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- python3 "${TRAIN_PY_PATH}" \
@@ -105,25 +243,30 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   "${MODEL_ARGS[@]}" \
   --hf-checkpoint "${STUDENT_HF_CHECKPOINT_PATH}" \
   --ref-load "${STUDENT_REF_LOAD_PATH}" \
-  --load "${STUDENT_LOAD_PATH}" \
+  "${LOAD_ARGS[@]}" \
   --save "${STUDENT_SAVE_PATH}" \
-  --save-interval "${SAVE_INTERVAL:-20}" \
-  --prompt-data "${PROMPT_DATA:-${REPO_ROOT}/datasets/dapo-math-17k.jsonl}" \
+  --save-interval "${SAVE_INTERVAL:-100}" \
+  --prompt-data "${PROMPT_DATA:-${REPO_ROOT}/datasets/200k_prompt_for_distillation.jsonl}" \
   --input-key "${INPUT_KEY:-prompt}" \
   --apply-chat-template \
   --rollout-shuffle \
-  --num-rollout "${NUM_ROLLOUT:-300}" \
+  --num-rollout "${NUM_ROLLOUT:-${NUM_ROLLOUT_DEFAULT}}" \
   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}" \
   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}" \
   --num-steps-per-rollout 1 \
-  --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-4096}" \
+  --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}" \
+  --rollout-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}" \
+  --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}" \
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}" \
+  --rollout-top-p "${ROLLOUT_TOP_P}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE}" \
   --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-5}" \
   --balance-data \
   --optimizer adam \
-  --lr "${LR:-1e-6}" \
+  --lr "${LR}" \
+  --lr-warmup-iters "${LR_WARMUP_ITERS}" \
   --lr-decay-style constant \
+  --clip-grad "${CLIP_GRAD}" \
   --weight-decay "${WEIGHT_DECAY:-0.1}" \
   --adam-beta1 "${ADAM_BETA1:-0.9}" \
   --adam-beta2 "${ADAM_BETA2:-0.98}" \
@@ -148,7 +291,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   --recompute-method uniform \
   --recompute-num-layers "${RECOMPUTE_NUM_LAYERS:-1}" \
   --use-dynamic-batch-size \
-  --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-16384}" \
+  --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}" \
   --sglang-mem-fraction-static "${ROLLOUT_SGLANG_MEM_FRACTION_STATIC:-0.7}" \
   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 "${SGLANG_CUDA_GRAPH_BS_MAX:-256}") \
   --use-wandb \

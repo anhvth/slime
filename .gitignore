@@ -193,3 +193,5 @@ _examples_synced/
 .env
 .DS_Store
 dapo-math-17k.jsonl
+.debug
+datasets

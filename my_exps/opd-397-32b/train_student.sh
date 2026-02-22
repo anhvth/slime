@@ -68,16 +68,122 @@ if [[ ! -f "${TRAIN_PY_PATH}" ]]; then
   exit 1
 fi
 
+# Non-async layout defaults: 7 Ray nodes x 8 GPUs.
+ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-7}"
+ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
+TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-8}"
+WORLD_SIZE=$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))
+(( WORLD_SIZE % TENSOR_MODEL_PARALLEL_SIZE == 0 )) || {
+  echo "Invalid parallelism: world_size=${WORLD_SIZE} not divisible by TP=${TENSOR_MODEL_PARALLEL_SIZE}" >&2
+  exit 1
+}
+DP_SIZE=$((WORLD_SIZE / TENSOR_MODEL_PARALLEL_SIZE))
+
+gcd() {
+  local a="$1"
+  local b="$2"
+  while (( b != 0 )); do
+    local t="$b"
+    b=$((a % b))
+    a="$t"
+  done
+  echo "$a"
+}
+
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
+BASE_PROMPTS_PER_DP="${BASE_PROMPTS_PER_DP:-4}"
+if [[ -z "${ROLLOUT_BATCH_SIZE:-}" ]]; then
+  ROLLOUT_BATCH_SIZE=$((BASE_PROMPTS_PER_DP * DP_SIZE))
+fi
+
+GCD_DP_NSAMPLES="$(gcd "${DP_SIZE}" "${N_SAMPLES_PER_PROMPT}")"
+ROLLOUT_BATCH_GRANULARITY=$((DP_SIZE / GCD_DP_NSAMPLES))
+if (( ROLLOUT_BATCH_SIZE % ROLLOUT_BATCH_GRANULARITY != 0 )); then
+  RAW_ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE}"
+  ROLLOUT_BATCH_SIZE=$(( (ROLLOUT_BATCH_SIZE / ROLLOUT_BATCH_GRANULARITY) * ROLLOUT_BATCH_GRANULARITY ))
+  (( ROLLOUT_BATCH_SIZE > 0 )) || ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_GRANULARITY}"
+  echo "Adjust rollout_batch_size ${RAW_ROLLOUT_BATCH_SIZE} -> ${ROLLOUT_BATCH_SIZE} (granularity=${ROLLOUT_BATCH_GRANULARITY} for dp_size=${DP_SIZE}, n_samples_per_prompt=${N_SAMPLES_PER_PROMPT})"
+fi
+TOTAL_SAMPLES=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
+if [[ -z "${GLOBAL_BATCH_SIZE:-}" ]]; then
+  GLOBAL_BATCH_SIZE="${TOTAL_SAMPLES}"
+elif (( GLOBAL_BATCH_SIZE != TOTAL_SAMPLES )); then
+  echo "Adjust global_batch_size ${GLOBAL_BATCH_SIZE} -> ${TOTAL_SAMPLES} to satisfy one train step per rollout"
+  GLOBAL_BATCH_SIZE="${TOTAL_SAMPLES}"
+fi
+(( GLOBAL_BATCH_SIZE % DP_SIZE == 0 )) || {
+  echo "Invalid batching after auto-adjust: global_batch_size=${GLOBAL_BATCH_SIZE} not divisible by dp_size=${DP_SIZE}" >&2
+  exit 1
+}
+TARGET_PROMPTS="${TARGET_PROMPTS:-200000}"
+if [[ ! "${TARGET_PROMPTS}" =~ ^[0-9]+$ ]] || (( TARGET_PROMPTS <= 0 )); then
+  echo "TARGET_PROMPTS must be a positive integer, got '${TARGET_PROMPTS}'" >&2
+  exit 1
+fi
+NUM_ROLLOUT_DEFAULT=$(((TARGET_PROMPTS + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE))
+
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs/opd-397-32b}"
 STUDENT_LOAD_PATH="${STUDENT_LOAD:-${OUTPUT_ROOT}/student_sync}"
 STUDENT_SAVE_PATH="${STUDENT_SAVE:-${OUTPUT_ROOT}/student_sync}"
 mkdir -p "${OUTPUT_ROOT}"
+PROMPT_DATA_PATH="${PROMPT_DATA:-${REPO_ROOT}/datasets/200k_prompt_for_distillation.jsonl}"
+if [[ ! -f "${PROMPT_DATA_PATH}" ]]; then
+  echo "Missing prompt dataset: ${PROMPT_DATA_PATH}" >&2
+  exit 1
+fi
+
+detect_rollout_context_len() {
+  local hf_path="$1"
+  local config_path="${hf_path%/}/config.json"
+  [[ -f "${config_path}" ]] || return 1
+
+  local context_len=""
+  context_len="$(awk -F: '/"max_position_embeddings"[[:space:]]*:/ {gsub(/[^0-9]/, "", $2); if (length($2) > 0) {print $2; exit}}' "${config_path}")"
+  if [[ -z "${context_len}" ]]; then
+    context_len="$(awk -F: '/"model_max_length"[[:space:]]*:/ {gsub(/[^0-9]/, "", $2); if (length($2) > 0) {print $2; exit}}' "${config_path}")"
+  fi
+
+  [[ -n "${context_len}" ]] || return 1
+  echo "${context_len}"
+}
+
+ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-2048}"
+if [[ -z "${ROLLOUT_MAX_CONTEXT_LEN:-}" ]]; then
+  ROLLOUT_MAX_CONTEXT_LEN="$(detect_rollout_context_len "${STUDENT_HF_CHECKPOINT_PATH}" || true)"
+fi
+[[ -n "${ROLLOUT_MAX_CONTEXT_LEN:-}" ]] || {
+  echo "Unable to determine ROLLOUT_MAX_CONTEXT_LEN from ${STUDENT_HF_CHECKPOINT_PATH}/config.json." >&2
+  echo "Set ROLLOUT_MAX_CONTEXT_LEN explicitly." >&2
+  exit 1
+}
+if [[ -z "${ROLLOUT_MAX_PROMPT_LEN:-}" ]]; then
+  ROLLOUT_MAX_PROMPT_LEN=$((ROLLOUT_MAX_CONTEXT_LEN - ROLLOUT_MAX_RESPONSE_LEN))
+fi
+for len_var in ROLLOUT_MAX_CONTEXT_LEN ROLLOUT_MAX_PROMPT_LEN ROLLOUT_MAX_RESPONSE_LEN; do
+  [[ "${!len_var}" =~ ^[0-9]+$ ]] || {
+    echo "${len_var} must be a positive integer, got '${!len_var}'" >&2
+    exit 1
+  }
+done
+(( ROLLOUT_MAX_PROMPT_LEN > 0 )) || {
+  echo "ROLLOUT_MAX_PROMPT_LEN must be > 0, got ${ROLLOUT_MAX_PROMPT_LEN}" >&2
+  exit 1
+}
+(( ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN <= ROLLOUT_MAX_CONTEXT_LEN )) || {
+  echo "Invalid rollout length limits:" >&2
+  echo "  rollout_max_prompt_len(${ROLLOUT_MAX_PROMPT_LEN}) + rollout_max_response_len(${ROLLOUT_MAX_RESPONSE_LEN})" >&2
+  echo "  exceeds rollout_max_context_len(${ROLLOUT_MAX_CONTEXT_LEN})" >&2
+  exit 1
+}
+echo "Rollout length limits: context=${ROLLOUT_MAX_CONTEXT_LEN}, prompt<=${ROLLOUT_MAX_PROMPT_LEN}, response<=${ROLLOUT_MAX_RESPONSE_LEN}"
 
 
-TEACHER_HOST="${TEACHER_HOST:-worker-15}"
+TEACHER_HOST="${TEACHER_HOST:-worker-29}"
 TEACHER_PORT="${TEACHER_PORT:-13141}"
 TEACHER_URL="${TEACHER_URL:-http://${TEACHER_HOST}:${TEACHER_PORT}/generate}"
 RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://127.0.0.1:${RAY_DASHBOARD_PORT:-8265}}"
+CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-15}"
 
 TEACHER_BASE="${TEACHER_URL%/generate}"
 if [[ "${TEACHER_BASE}" == "${TEACHER_URL}" ]]; then
@@ -85,8 +191,10 @@ if [[ "${TEACHER_BASE}" == "${TEACHER_URL}" ]]; then
   exit 1
 fi
 
-curl -sf "${TEACHER_BASE}/health_generate" >/dev/null
-curl -sf "${TEACHER_BASE}/get_model_info" >/dev/null
+echo "Preflight: checking teacher endpoints at ${TEACHER_BASE} ..."
+curl -sf --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${TEACHER_BASE}/health_generate" >/dev/null
+curl -sf --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${TEACHER_BASE}/get_model_info" >/dev/null
+echo "Preflight: teacher endpoints OK"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [[ "${NVLINK_COUNT}" -gt 0 ]]; then
@@ -104,16 +212,19 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-  --prompt-data "${PROMPT_DATA:-${REPO_ROOT}/datasets/dapo-math-17k.jsonl}"
+  --prompt-data "${PROMPT_DATA_PATH}"
   --input-key "${INPUT_KEY:-prompt}"
   --apply-chat-template
   --rollout-shuffle
-  --num-rollout "${NUM_ROLLOUT:-300}"
-  --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-24}"
-  --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-4}"
-  --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-2048}"
+  --num-rollout "${NUM_ROLLOUT:-${NUM_ROLLOUT_DEFAULT}}"
+  --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+  --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
+  --num-steps-per-rollout 1
+  --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
+  --rollout-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}"
+  --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
-  --global-batch-size "${GLOBAL_BATCH_SIZE:-96}"
+  --global-batch-size "${GLOBAL_BATCH_SIZE}"
   --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-5}"
   --balance-data
 )
@@ -136,7 +247,7 @@ if [[ -n "${EVAL_PROMPT_DATA:-}" ]]; then
 fi
 
 PERF_ARGS=(
-  --tensor-model-parallel-size "${TENSOR_MODEL_PARALLEL_SIZE:-8}"
+  --tensor-model-parallel-size "${TENSOR_MODEL_PARALLEL_SIZE}"
   --sequence-parallel
   --pipeline-model-parallel-size "${PIPELINE_MODEL_PARALLEL_SIZE:-1}"
   --context-parallel-size "${CONTEXT_PARALLEL_SIZE:-1}"
@@ -223,8 +334,8 @@ RUNTIME_ENV_JSON="{
 }"
 
 LAYOUT_ARGS=(
-  --actor-num-nodes "${ACTOR_NUM_NODES:-3}"
-  --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE:-8}"
+  --actor-num-nodes "${ACTOR_NUM_NODES}"
+  --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}"
   --colocate
 )
 
@@ -236,6 +347,9 @@ if [[ ${DEBUG} -eq 1 ]]; then
 fi
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log}"
 echo "Tee logging to: ${LOG_FILE}"
+echo "Launch config: actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE} (world=${WORLD_SIZE}, dp=${DP_SIZE}, tp=${TENSOR_MODEL_PARALLEL_SIZE}), rollout_batch=${ROLLOUT_BATCH_SIZE}, n_samples=${N_SAMPLES_PER_PROMPT}, global_batch=${GLOBAL_BATCH_SIZE}"
+echo "Length config: rollout_max_context_len=${ROLLOUT_MAX_CONTEXT_LEN}, rollout_max_prompt_len=${ROLLOUT_MAX_PROMPT_LEN}, rollout_max_response_len=${ROLLOUT_MAX_RESPONSE_LEN}"
+echo "Submitting Ray job to ${RAY_JOB_ADDRESS}"
 
 ray job submit --address="${RAY_JOB_ADDRESS}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
