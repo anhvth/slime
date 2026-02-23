@@ -36,7 +36,12 @@ PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py \
     --input-dir /path/to/torch_dist/ckpt/iter_xxx/ \
     --output-dir /path/to/output \
     --origin-hf-dir /path/to/origin/hf
+
+# For large models, use torchrun for multi-GPU conversion
+torchrun --nproc_per_node=8 tools/convert_hf_to_torch_dist.py ...
 ```
+
+**Note**: Always set `PYTHONPATH=/root/Megatron-LM` when running tools.
 
 ### Code Quality
 
@@ -119,6 +124,11 @@ Verify config parameters match your model version (especially `--rotary-base`).
 
 Enable `--use-dynamic-batch-size` with `--max-tokens-per-gpu` for efficient token-based batching. This is the recommended approach and does not affect loss calculation.
 
+## Checkpoint Management
+
+- `--no-save-optim`: Save model weights only (no optimizer state), reducing checkpoint size by ~70-80%. Note: Cannot resume training from these checkpoints.
+- `--save-hf <path>`: Save in HuggingFace format directly during training.
+
 ## Custom Extensions
 
 For multi-turn or tool-use scenarios:
@@ -139,3 +149,11 @@ For multi-turn or tool-use scenarios:
 - For profiling, see `docs/en/developer_guide/profiling.md`
 - Use `PYTHONBUFFERED=16` to prevent Ray from buffering stdout/stderr
 - For multi-node training, start Ray cluster first: `ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8`
+
+### Debug Flags
+
+- `--debug-rollout-only`: Initialize SGLang only (no Megatron) for debugging inference
+- `--debug-train-only`: Initialize Megatron only (no SGLang) for debugging training
+- `--save-debug-rollout-data <path>`: Save rollout data for later replay
+- `--load-debug-rollout-data <path>`: Load saved rollout data for reproducible training debug
+- `CUDA_LAUNCH_BLOCKING=1`: Enable for debugging SGLang illegal memory access issues

@@ -275,6 +275,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   "${LOAD_ARGS[@]}" \
   --save "${STUDENT_SAVE_PATH}" \
   --save-interval "${SAVE_INTERVAL:-100}" \
+  --no-save-optim \
   --prompt-data "${PROMPT_DATA:-${REPO_ROOT}/datasets/200k_prompt_for_distillation.jsonl}" \
   --input-key "${INPUT_KEY:-prompt}" \
   --apply-chat-template \
