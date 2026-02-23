@@ -22,17 +22,20 @@ echo "===== $(date '+%Y-%m-%d %H:%M:%S') train_student_async start ====="
 
 export PYTHONBUFFERED=1
 if [[ ${DEBUG} -eq 1 ]]; then
-  source "${REPO_ROOT}/scripts/models/qwen3-4B-as-qwen35.sh"
+  MODEL_CONFIG_REL="scripts/models/qwen3-4B-as-qwen35.sh"
   STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT:-/home/anhvth8/ckpt/hf_models/Qwen/Qwen3-4B-As-Qwen35}"
 else
-  source "${REPO_ROOT}/scripts/models/qwen3-32B-as-qwen35.sh"
-  STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT:-/home/anhvth8/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35}"
+  MODEL_CONFIG_REL="scripts/models/qwen3-32B-as-qwen35.sh"
+  STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT:-$HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned/}"
 fi
+MODEL_CONFIG_SCRIPT="${REPO_ROOT}/${MODEL_CONFIG_REL}"
+source "${MODEL_CONFIG_SCRIPT}"
 
 TRAIN_PY_PATH="${TRAIN_PY_PATH:-${REPO_ROOT}/train_async.py}"
 [[ -f "${TRAIN_PY_PATH}" ]] || { echo "Missing train entrypoint: ${TRAIN_PY_PATH}" >&2; exit 1; }
 
 STUDENT_HF_CHECKPOINT_PATH="${STUDENT_HF_CHECKPOINT:-${STUDENT_HF_DEFAULT}}"
+STUDENT_HF_CHECKPOINT_PATH="${STUDENT_HF_CHECKPOINT_PATH%/}"
 STUDENT_REF_LOAD_PATH="${STUDENT_REF_LOAD:-${STUDENT_HF_CHECKPOINT_PATH}_torch_dist}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs/opd-397-32b}"
 STUDENT_SAVE_PATH="${STUDENT_SAVE:-${OUTPUT_ROOT}/student_async}"
@@ -46,53 +49,39 @@ else
 fi
 mkdir -p "${OUTPUT_ROOT}"
 
-[[ -e "${STUDENT_HF_CHECKPOINT_PATH}" ]] || {
-  echo "Missing student HF checkpoint path: ${STUDENT_HF_CHECKPOINT_PATH}" >&2
+ENSURE_REF_MODEL_SCRIPT="${SCRIPT_DIR}/ensure_ref_model.sh"
+[[ -f "${ENSURE_REF_MODEL_SCRIPT}" ]] || {
+  echo "Missing ref model helper script: ${ENSURE_REF_MODEL_SCRIPT}" >&2
   exit 1
 }
-[[ -e "${STUDENT_REF_LOAD_PATH}" ]] || {
-  echo "Missing student ref-load path: ${STUDENT_REF_LOAD_PATH}" >&2
-  exit 1
-}
+bash "${ENSURE_REF_MODEL_SCRIPT}" \
+  --repo-root "${REPO_ROOT}" \
+  --model-config-rel "${MODEL_CONFIG_REL}" \
+  --hf-checkpoint "${STUDENT_HF_CHECKPOINT_PATH}" \
+  --ref-load "${STUDENT_REF_LOAD_PATH}" \
+  --megatron-pythonpath "${MEGATRON_PYTHONPATH:-/root/Megatron-LM}"
 
 MAX_CHECKPOINTS_TO_KEEP="${MAX_CHECKPOINTS_TO_KEEP:-5}"
 CHECKPOINT_PRUNE_INTERVAL_SEC="${CHECKPOINT_PRUNE_INTERVAL_SEC:-300}"
-
-prune_old_checkpoints() {
-  local ckpt_root="$1"
-  local keep_n="$2"
-  [[ -d "${ckpt_root}" ]] || return 0
-  [[ "${keep_n}" -gt 0 ]] || return 0
-
-  local ckpts=()
-  mapfile -t ckpts < <(find "${ckpt_root}" -maxdepth 1 -mindepth 1 -type d -name 'iter_[0-9][0-9][0-9][0-9][0-9][0-9][0-9]' | sort)
-  local count="${#ckpts[@]}"
-  (( count > keep_n )) || return 0
-
-  local delete_n=$((count - keep_n))
-  for ((i = 0; i < delete_n; i++)); do
-    rm -rf -- "${ckpts[$i]}"
-  done
+PRUNE_CKPT_SCRIPT="${SCRIPT_DIR}/prune_old_ckpt.sh"
+[[ -f "${PRUNE_CKPT_SCRIPT}" ]] || {
+  echo "Missing checkpoint pruner script: ${PRUNE_CKPT_SCRIPT}" >&2
+  exit 1
+}
+[[ "${MAX_CHECKPOINTS_TO_KEEP}" =~ ^[0-9]+$ ]] || {
+  echo "MAX_CHECKPOINTS_TO_KEEP must be a non-negative integer, got '${MAX_CHECKPOINTS_TO_KEEP}'" >&2
+  exit 1
+}
+[[ "${CHECKPOINT_PRUNE_INTERVAL_SEC}" =~ ^[0-9]+$ ]] || {
+  echo "CHECKPOINT_PRUNE_INTERVAL_SEC must be a positive integer, got '${CHECKPOINT_PRUNE_INTERVAL_SEC}'" >&2
+  exit 1
+}
+(( CHECKPOINT_PRUNE_INTERVAL_SEC > 0 )) || {
+  echo "CHECKPOINT_PRUNE_INTERVAL_SEC must be > 0, got '${CHECKPOINT_PRUNE_INTERVAL_SEC}'" >&2
+  exit 1
 }
 
-start_checkpoint_pruner() {
-  [[ "${MAX_CHECKPOINTS_TO_KEEP}" -gt 0 ]] || return 0
-  (
-    while true; do
-      prune_old_checkpoints "${STUDENT_SAVE_PATH}" "${MAX_CHECKPOINTS_TO_KEEP}" || true
-      sleep "${CHECKPOINT_PRUNE_INTERVAL_SEC}"
-    done
-  ) &
-  CKPT_PRUNER_PID=$!
-}
-
-stop_checkpoint_pruner() {
-  if [[ -n "${CKPT_PRUNER_PID:-}" ]]; then
-    kill "${CKPT_PRUNER_PID}" >/dev/null 2>&1 || true
-  fi
-}
-
-TEACHER_HOST="${TEACHER_HOST:-worker-29}"
+TEACHER_HOST="${TEACHER_HOST:-worker-30}"
 TEACHER_PORT="${TEACHER_PORT:-13141}"
 TEACHER_URL="${TEACHER_URL:-http://${TEACHER_HOST}:${TEACHER_PORT}/generate}"
 TEACHER_BASE="${TEACHER_URL%/generate}"
@@ -101,12 +90,39 @@ TEACHER_BASE="${TEACHER_URL%/generate}"
 curl -sf "${TEACHER_BASE}/health_generate" >/dev/null
 curl -sf "${TEACHER_BASE}/get_model_info" >/dev/null
 
-RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://127.0.0.1:${RAY_DASHBOARD_PORT:-8265}}"
+resolve_ray_job_address() {
+  if [[ -n "${RAY_JOB_ADDRESS:-}" ]]; then
+    echo "${RAY_JOB_ADDRESS}"
+    return 0
+  fi
 
-# Opinionated async layout for a 56-GPU cluster: 24 train (3 nodes) + 32 rollout (4 nodes).
-ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-3}"
+  local job_list_output=""
+  job_list_output="$(ray job list 2>&1 | sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g')" || {
+    echo "Failed to run 'ray job list' to detect RAY_JOB_ADDRESS." >&2
+    exit 1
+  }
+  local detected_addr=""
+  detected_addr="$(printf '%s\n' "${job_list_output}" | grep -Eo 'https?://[^[:space:]]+' | head -n1 || true)"
+  if [[ -z "${detected_addr}" ]]; then
+    echo "Could not detect RAY_JOB_ADDRESS from 'ray job list' output." >&2
+    echo "Set RAY_JOB_ADDRESS explicitly, e.g. RAY_JOB_ADDRESS=http://<head-ip>:8265" >&2
+    exit 1
+  fi
+  echo "${detected_addr}"
+}
+
+RAY_JOB_ADDRESS="$(resolve_ray_job_address)"
+if ! ray job list --address="${RAY_JOB_ADDRESS}" >/dev/null 2>&1; then
+  echo "Unable to reach Ray Job server at ${RAY_JOB_ADDRESS}." >&2
+  echo "Set RAY_JOB_ADDRESS explicitly, e.g. RAY_JOB_ADDRESS=http://<head-ip>:8265" >&2
+  exit 1
+fi
+echo "Using Ray Job server: ${RAY_JOB_ADDRESS}"
+
+# Opinionated async layout for a 120-GPU cluster (15x8): 56 train (7 nodes) + 64 rollout (8 nodes).
+ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-7}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
-ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-32}"
+ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-64}"
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-8}"
 
 TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-8}"
@@ -225,8 +241,21 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
-start_checkpoint_pruner
-trap stop_checkpoint_pruner EXIT
+CKPT_PRUNER_PID=""
+if (( MAX_CHECKPOINTS_TO_KEEP > 0 )); then
+  bash "${PRUNE_CKPT_SCRIPT}" \
+    --ckpt-root "${STUDENT_SAVE_PATH}" \
+    --keep "${MAX_CHECKPOINTS_TO_KEEP}" \
+    --interval-sec "${CHECKPOINT_PRUNE_INTERVAL_SEC}" &
+  CKPT_PRUNER_PID=$!
+fi
+cleanup() {
+  if [[ -n "${CKPT_PRUNER_PID}" ]]; then
+    kill "${CKPT_PRUNER_PID}" >/dev/null 2>&1 || true
+    wait "${CKPT_PRUNER_PID}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
 LOAD_ARGS=()
 if [[ -n "${STUDENT_LOAD_PATH}" ]]; then

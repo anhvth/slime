@@ -9,6 +9,15 @@ import numpy as np
 import ray
 
 try:
+    from datasets import Dataset as HFDataset
+    from datasets import DatasetDict as HFDatasetDict
+    from datasets import load_from_disk
+except ImportError:
+    HFDataset = None
+    HFDatasetDict = None
+    load_from_disk = None
+
+try:
     import pyarrow.parquet as pq
 except ImportError:
     pq = None
@@ -29,7 +38,39 @@ def read_file(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Prompt dataset path '{path}' does not exist.")
 
-    if path.endswith(".jsonl"):
+    if os.path.isdir(path):
+        if load_from_disk is None:
+            raise ImportError("datasets is required for HuggingFace dataset directory support")
+
+        def hf_disk_reader(p):
+            try:
+                hf_ds = load_from_disk(p)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load '{p}' as a HuggingFace dataset directory. "
+                    "Provide a valid save_to_disk path, .jsonl, or .parquet file."
+                ) from e
+
+            if HFDataset is not None and isinstance(hf_ds, HFDataset):
+                logger.info("read_file path=%s loaded HuggingFace Dataset with %d rows", p, len(hf_ds))
+                yield from hf_ds
+                return
+
+            if HFDatasetDict is not None and isinstance(hf_ds, HFDatasetDict):
+                # Keep split order from the underlying DatasetDict for deterministic iteration.
+                split_names = list(hf_ds.keys())
+                logger.info("read_file path=%s loaded HuggingFace DatasetDict with splits=%s", p, split_names)
+                for split_name in split_names:
+                    split_ds = hf_ds[split_name]
+                    logger.info("read_file path=%s iterating split=%s rows=%d", p, split_name, len(split_ds))
+                    yield from split_ds
+                return
+
+            raise TypeError(f"Unsupported HuggingFace dataset object type: {type(hf_ds)}")
+
+        reader = hf_disk_reader(path)
+
+    elif path.endswith(".jsonl"):
 
         def jsonl_reader(p):
             with open(p, encoding="utf-8") as f:
@@ -58,7 +99,9 @@ def read_file(path):
         reader = parquet_reader(path)
 
     else:
-        raise ValueError(f"Unsupported file format: {path}. Supported formats are .jsonl and .parquet.")
+        raise ValueError(
+            f"Unsupported file format: {path}. Supported inputs are HuggingFace dataset directories, .jsonl, and .parquet."
+        )
 
     if row_slice is not None:
 
@@ -205,11 +248,20 @@ class Dataset:
             if tool_key is not None and tool_key in data:
                 tools = data[tool_key]
                 if isinstance(tools, str):
-                    tools = json.loads(tools)
+                    if tools.strip():
+                        tools = json.loads(tools)
+                    else:
+                        tools = None
                 elif isinstance(tools, np.ndarray):
                     tools = tools.tolist()
-                assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
-                metadata["tools"] = tools
+
+                # Some datasets store missing tools as null/NaN; treat them as absent tools.
+                if isinstance(tools, float) and np.isnan(tools):
+                    tools = None
+
+                if tools is not None:
+                    assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
+                    metadata["tools"] = tools
 
             if apply_chat_template:
                 output_prompt = tokenizer.apply_chat_template(

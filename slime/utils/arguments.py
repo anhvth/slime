@@ -550,7 +550,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "The path to the prompt data. "
-                    "Currently we only support jsonl format, and each line should contains --input-key and --label-key, "
+                    "Supports HuggingFace dataset directories (saved by datasets.save_to_disk), .jsonl, and .parquet. "
+                    "For .jsonl/.parquet, each row should contain --input-key and --label-key, "
                     "which will be used as the prompt and the label respectively. "
                     "If you want to use a custom template, you can set --apply-chat-template to true, in that case, "
                     "the input should be the same structure as an openai message, e.g. [{'role': 'user', 'content': 'blabla'}]. "
@@ -1854,6 +1855,25 @@ def hf_validate_args(args, hf_config):
     def equal(x, y):
         return x == y
 
+    def get_hf_rope_theta(config):
+        # Some configs (e.g., Qwen3) store the effective rope theta under rope_parameters,
+        # while the top-level rope_theta may keep a legacy/default value.
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_theta = rope_parameters.get("rope_theta", None)
+            if rope_theta is not None:
+                return "rope_parameters.rope_theta", rope_theta
+
+        if rope_parameters is not None and hasattr(rope_parameters, "rope_theta"):
+            rope_theta = getattr(rope_parameters, "rope_theta")
+            if rope_theta is not None:
+                return "rope_parameters.rope_theta", rope_theta
+
+        if hasattr(config, "rope_theta"):
+            return "rope_theta", getattr(config, "rope_theta")
+
+        return None, None
+
     errors = []
 
     # multimodal models have different config structure
@@ -1867,7 +1887,6 @@ def hf_validate_args(args, hf_config):
         ("intermediate_size", "ffn_hidden_size", equal),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
         ("rms_norm_eps", "norm_epsilon", equal),
-        ("rope_theta", "rotary_base", equal),
     ]:
         if hasattr(hf_config, hf_config_name):
             if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
@@ -1875,6 +1894,14 @@ def hf_validate_args(args, hf_config):
                     f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
                     f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
                 )
+
+    hf_rope_theta_name, hf_rope_theta = get_hf_rope_theta(hf_config)
+    if hf_rope_theta is not None:
+        if not equal(hf_rope_theta, args.rotary_base):
+            errors.append(
+                f"{hf_rope_theta_name} in hf config {hf_rope_theta} is not equal to "
+                f"rotary_base {args.rotary_base}, please check the config."
+            )
 
     if len(errors) > 0:
         raise AssertionError("hf_validate_args failed: " + "; ".join(errors))
