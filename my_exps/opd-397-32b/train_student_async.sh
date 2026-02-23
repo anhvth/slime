@@ -260,6 +260,8 @@ trap cleanup EXIT
 LOAD_ARGS=()
 if [[ -n "${STUDENT_LOAD_PATH}" ]]; then
   LOAD_ARGS+=(--load "${STUDENT_LOAD_PATH}")
+  # When resuming from a checkpoint saved with --no-save-optim, skip loading optimizer state
+  LOAD_ARGS+=(--no-load-optim)
 fi
 
 ray job submit --address="${RAY_JOB_ADDRESS}" \
@@ -275,7 +277,6 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   "${LOAD_ARGS[@]}" \
   --save "${STUDENT_SAVE_PATH}" \
   --save-interval "${SAVE_INTERVAL:-100}" \
-  --no-save-optim \
   --prompt-data "${PROMPT_DATA:-${REPO_ROOT}/datasets/200k_prompt_for_distillation.jsonl}" \
   --input-key "${INPUT_KEY:-prompt}" \
   --apply-chat-template \

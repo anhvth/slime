@@ -13,7 +13,7 @@ Options:
   --dry-run  Print matching jobs without stopping them.
 
 Environment:
-  RAY_JOB_ADDRESS   Ray job server address (default: http://127.0.0.1:8265)
+  RAY_JOB_ADDRESS   Ray job server address (auto-detected from 'ray job list' when unset)
 EOF
 }
 
@@ -42,14 +42,41 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://127.0.0.1:8265}"
-RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS%/}"
-JOBS_ENDPOINT="${RAY_JOB_ADDRESS}/api/jobs/"
-
 if ! command -v ray >/dev/null 2>&1; then
   echo "ray CLI not found in PATH." >&2
   exit 1
 fi
+
+resolve_ray_job_address() {
+  if [[ -n "${RAY_JOB_ADDRESS:-}" ]]; then
+    echo "${RAY_JOB_ADDRESS}"
+    return 0
+  fi
+
+  local job_list_output=""
+  job_list_output="$(ray job list 2>&1 | sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g')" || {
+    echo "Failed to run 'ray job list' to detect RAY_JOB_ADDRESS." >&2
+    exit 1
+  }
+  local detected_addr=""
+  detected_addr="$(printf '%s\n' "${job_list_output}" | grep -Eo 'https?://[^[:space:]]+' | head -n1 || true)"
+  if [[ -z "${detected_addr}" ]]; then
+    echo "Could not detect RAY_JOB_ADDRESS from 'ray job list' output." >&2
+    echo "Set RAY_JOB_ADDRESS explicitly, e.g. RAY_JOB_ADDRESS=http://<head-ip>:8265" >&2
+    exit 1
+  fi
+  echo "${detected_addr}"
+}
+
+RAY_JOB_ADDRESS="$(resolve_ray_job_address)"
+RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS%/}"
+if ! ray job list --address="${RAY_JOB_ADDRESS}" >/dev/null 2>&1; then
+  echo "Unable to reach Ray Job server at ${RAY_JOB_ADDRESS}." >&2
+  echo "Set RAY_JOB_ADDRESS explicitly, e.g. RAY_JOB_ADDRESS=http://<head-ip>:8265" >&2
+  exit 1
+fi
+
+JOBS_ENDPOINT="${RAY_JOB_ADDRESS}/api/jobs/"
 
 if ! JOBS_JSON="$(curl -sf "${JOBS_ENDPOINT}")"; then
   echo "Failed to fetch jobs from ${JOBS_ENDPOINT}" >&2
