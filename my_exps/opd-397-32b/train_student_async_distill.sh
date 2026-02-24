@@ -200,6 +200,16 @@ build_distill_args
 
 echo "Distillation mode: ${DISTILL_LOSS_MODE} (topk=${OPD_TOP_LOGPROBS_NUM}, mixed_weight=${OPD_MIXED_KL_WEIGHT}, jsd_beta=${OPD_JSD_BETA}, coef=${OPD_DISTILL_COEF})"
 
+DATASET_KEY_ARGS=(
+  --input-key "${INPUT_KEY:-prompt}"
+)
+if [[ -n "${LABEL_KEY:-}" ]]; then
+  DATASET_KEY_ARGS+=(--label-key "${LABEL_KEY}")
+fi
+if [[ -n "${METADATA_KEY:-}" ]]; then
+  DATASET_KEY_ARGS+=(--metadata-key "${METADATA_KEY}")
+fi
+
 ray job submit --address="${RAY_JOB_ADDRESS}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- python3 "${TRAIN_PY_PATH}" \
@@ -214,7 +224,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   --save "${STUDENT_SAVE_PATH}" \
   --save-interval "${SAVE_INTERVAL:-100}" \
   --prompt-data "${PROMPT_DATA:-${REPO_ROOT}/datasets/200k_prompt_for_distillation.jsonl}" \
-  --input-key "${INPUT_KEY:-prompt}" \
+  "${DATASET_KEY_ARGS[@]}" \
   --apply-chat-template \
   --rollout-shuffle \
   --num-rollout "${NUM_ROLLOUT:-${NUM_ROLLOUT_DEFAULT}}" \

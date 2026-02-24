@@ -55,6 +55,31 @@ PY
   fi
 }
 
+normalize_bool_flag() {
+  local value="$1"
+  local name="$2"
+  value="$(echo "${value}" | tr '[:upper:]' '[:lower:]')"
+  case "${value}" in
+    1|true|yes|y|on)
+      echo "1"
+      ;;
+    0|false|no|n|off|"")
+      echo "0"
+      ;;
+    *)
+      echo "${name} must be one of: 0/1, true/false, yes/no, on/off. Got '${value}'" >&2
+      exit 1
+      ;;
+  esac
+}
+
+yaml_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "${value}"
+}
+
 resolve_ray_job_address() {
   if [[ -n "${RAY_JOB_ADDRESS:-}" ]]; then
     echo "${RAY_JOB_ADDRESS}"
@@ -138,6 +163,13 @@ setup_distill_mode() {
 
   OPD_JSD_BETA="${OPD_JSD_BETA:-0.5}"
   require_float_range "${OPD_JSD_BETA}" "OPD_JSD_BETA" "0" "1"
+
+  OPD_PRIVILEGED_ENABLE="$(normalize_bool_flag "${OPD_PRIVILEGED_ENABLE:-0}" "OPD_PRIVILEGED_ENABLE")"
+  OPD_PRIVILEGED_METADATA_KEY="${OPD_PRIVILEGED_METADATA_KEY:-privileged_context}"
+  OPD_PRIVILEGED_FALLBACK_LABEL="$(normalize_bool_flag "${OPD_PRIVILEGED_FALLBACK_LABEL:-1}" "OPD_PRIVILEGED_FALLBACK_LABEL")"
+  OPD_PRIVILEGED_OPEN_TAG="${OPD_PRIVILEGED_OPEN_TAG:-[PRIVILEGED_CONTEXT]}"
+  OPD_PRIVILEGED_CLOSE_TAG="${OPD_PRIVILEGED_CLOSE_TAG:-[/PRIVILEGED_CONTEXT]}"
+  OPD_PRIVILEGED_TOKENIZER_PATH="${OPD_PRIVILEGED_TOKENIZER_PATH:-}"
 }
 
 build_distill_args() {
@@ -166,6 +198,12 @@ distill_loss_mode: ${DISTILL_LOSS_MODE}
 opd_top_logprobs_num: ${OPD_TOP_LOGPROBS_NUM}
 opd_mixed_kl_weight: ${OPD_MIXED_KL_WEIGHT}
 opd_distill_coef: ${OPD_DISTILL_COEF}
+opd_privileged_enable: ${OPD_PRIVILEGED_ENABLE}
+opd_privileged_metadata_key: "$(yaml_escape "${OPD_PRIVILEGED_METADATA_KEY}")"
+opd_privileged_fallback_label: ${OPD_PRIVILEGED_FALLBACK_LABEL}
+opd_privileged_open_tag: "$(yaml_escape "${OPD_PRIVILEGED_OPEN_TAG}")"
+opd_privileged_close_tag: "$(yaml_escape "${OPD_PRIVILEGED_CLOSE_TAG}")"
+opd_privileged_tokenizer_path: "$(yaml_escape "${OPD_PRIVILEGED_TOKENIZER_PATH}")"
 EOF
 
   if [[ "${DISTILL_LOSS_MODE}" == "jsd" ]]; then

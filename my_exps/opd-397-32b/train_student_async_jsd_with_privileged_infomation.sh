@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+TARGET_SCRIPT="${SCRIPT_DIR}/train_student_async_distill.sh"
+
+if [[ ! -f "${TARGET_SCRIPT}" ]]; then
+  echo "Missing script: ${TARGET_SCRIPT}" >&2
+  exit 1
+fi
+
+export DISTILL_LOSS_MODE="${DISTILL_LOSS_MODE:-jsd}"
+export OPD_JSD_BETA="${OPD_JSD_BETA:-0.5}"
+export OPD_TOP_LOGPROBS_NUM="${OPD_TOP_LOGPROBS_NUM:-16}"
+
+export OPD_PRIVILEGED_ENABLE="${OPD_PRIVILEGED_ENABLE:-1}"
+export OPD_PRIVILEGED_METADATA_KEY="${OPD_PRIVILEGED_METADATA_KEY:-privileged_context}"
+export OPD_PRIVILEGED_FALLBACK_LABEL="${OPD_PRIVILEGED_FALLBACK_LABEL:-1}"
+export OPD_PRIVILEGED_OPEN_TAG="${OPD_PRIVILEGED_OPEN_TAG:-[PRIVILEGED_CONTEXT]}"
+export OPD_PRIVILEGED_CLOSE_TAG="${OPD_PRIVILEGED_CLOSE_TAG:-[/PRIVILEGED_CONTEXT]}"
+
+if [[ -z "${OPD_PRIVILEGED_TOKENIZER_PATH:-}" && -n "${STUDENT_HF_CHECKPOINT:-}" ]]; then
+  export OPD_PRIVILEGED_TOKENIZER_PATH="${STUDENT_HF_CHECKPOINT%/}"
+fi
+
+export LABEL_KEY="${LABEL_KEY:-label}"
+export METADATA_KEY="${METADATA_KEY:-metadata}"
+
+echo "[wrapper] DISTILL_LOSS_MODE=${DISTILL_LOSS_MODE}, privileged_key=${OPD_PRIVILEGED_METADATA_KEY}"
+exec "${TARGET_SCRIPT}" "$@"

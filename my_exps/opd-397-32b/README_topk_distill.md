@@ -7,6 +7,9 @@ This experiment folder now supports four distillation modes via `train_student_a
 - `mixed`: weighted blend of forward + reverse(top-k) KL.
 - `jsd`: top-k renormalized Jensen-Shannon divergence.
 
+It also supports optional **privileged teacher context** (teacher-only side information)
+for top-k modes through `opd_topk_reward_plugin.py`.
+
 ## What changed
 
 - Added API-contract tests for teacher server (`worker-30:13141`) in:
@@ -22,6 +25,8 @@ This experiment folder now supports four distillation modes via `train_student_a
 - Wired mode switch in:
   - `my_exps/opd-397-32b/train_student_async_distill.sh`
   - `my_exps/opd-397-32b/train_student_async_distill_lib.sh`
+- Added privileged JSD wrapper launcher:
+  - `my_exps/opd-397-32b/train_student_async_jsd_with_privileged_infomation.sh`
 
 ## Comparison with existing default OPD
 
@@ -56,6 +61,12 @@ Set these env vars when running `my_exps/opd-397-32b/train_student_async_distill
 - `OPD_MIXED_KL_WEIGHT` (default: `0.5`, only used by `mixed`)
 - `OPD_JSD_BETA` (default: `0.5`, only used by `jsd`)
 - `OPD_DISTILL_COEF` (default: `1.0`, scales custom distillation loss)
+- `OPD_PRIVILEGED_ENABLE` (default: `0`; when `1`, enable privileged teacher context path)
+- `OPD_PRIVILEGED_METADATA_KEY` (default: `privileged_context`)
+- `OPD_PRIVILEGED_FALLBACK_LABEL` (default: `1`; fallback to `label` when metadata key is missing/empty)
+- `OPD_PRIVILEGED_OPEN_TAG` (default: `[PRIVILEGED_CONTEXT]`)
+- `OPD_PRIVILEGED_CLOSE_TAG` (default: `[/PRIVILEGED_CONTEXT]`)
+- `OPD_PRIVILEGED_TOKENIZER_PATH` (default: empty; fallback to `--hf-checkpoint`)
 
 Examples:
 
@@ -74,10 +85,38 @@ DISTILL_LOSS_MODE=mixed OPD_TOP_LOGPROBS_NUM=16 OPD_MIXED_KL_WEIGHT=0.5 \
 # Top-k renormalized JSD
 DISTILL_LOSS_MODE=jsd OPD_TOP_LOGPROBS_NUM=16 OPD_JSD_BETA=0.5 \
   OPD_DISTILL_COEF=1.0 bash my_exps/opd-397-32b/train_student_async_distill.sh
+
+# Privileged top-k JSD wrapper (defaults to jsd + privileged enabled)
+bash my_exps/opd-397-32b/train_student_async_jsd_with_privileged_infomation.sh
 ```
 
 Backward-compatible alias:
 `my_exps/opd-397-32b/train_student_async_forward_kl.sh` now forwards to `train_student_async_distill.sh`.
+
+## Dataset contract for privileged context
+
+To provide teacher-only privileged information, pass dataset keys through:
+
+- `LABEL_KEY` -> `--label-key` (optional fallback source)
+- `METADATA_KEY` -> `--metadata-key` (default: `metadata`)
+
+Expected row shape for preferred path:
+
+```json
+{
+  "prompt": "...",
+  "label": "... optional ...",
+  "metadata": {
+    "privileged_context": "... teacher-only text ..."
+  }
+}
+```
+
+Resolution order in plugin:
+
+1. `sample.metadata[opd_privileged_metadata_key]`
+2. `sample.label` (if `opd_privileged_fallback_label=1`)
+3. Prompt-only scoring fallback (no privileged append)
 
 ## Current limitations (v1)
 
