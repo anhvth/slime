@@ -1,3 +1,5 @@
+import importlib
+import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -29,6 +31,23 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
+
+logger = logging.getLogger(__name__)
+_RKL_DEBUG_DUMP_FN = None
+_RKL_DEBUG_DUMP_LOAD_ATTEMPTED = False
+
+
+def _maybe_get_rkl_debug_dump_fn():
+    global _RKL_DEBUG_DUMP_FN, _RKL_DEBUG_DUMP_LOAD_ATTEMPTED
+    if _RKL_DEBUG_DUMP_LOAD_ATTEMPTED:
+        return _RKL_DEBUG_DUMP_FN
+    _RKL_DEBUG_DUMP_LOAD_ATTEMPTED = True
+    try:
+        module = importlib.import_module("opd_debug_dump")
+        _RKL_DEBUG_DUMP_FN = getattr(module, "dump_rkl_debug_update", None)
+    except Exception:
+        _RKL_DEBUG_DUMP_FN = None
+    return _RKL_DEBUG_DUMP_FN
 
 
 def get_responses(
@@ -395,6 +414,19 @@ def apply_opd_kl_to_advantages(
 
     # Store reverse KL for logging
     rollout_data["opd_reverse_kl"] = reverse_kls
+
+    dump_fn = _maybe_get_rkl_debug_dump_fn()
+    if dump_fn is not None:
+        try:
+            dump_fn(
+                args,
+                rollout_data=rollout_data,
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
+                reverse_kls=reverse_kls,
+            )
+        except Exception:
+            logger.warning("Failed to save rkl distillation debug dump.", exc_info=True)
 
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:

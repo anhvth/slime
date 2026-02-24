@@ -72,6 +72,14 @@ Set these env vars when running `my_exps/opd-397-32b/train_student_async_distill
 - `OPD_RM_TOTAL_TIMEOUT_S` (default: `180.0`)
 - `OPD_RM_MAX_CONNECTIONS` (default: `512`)
 - `OPD_RM_MAX_CONNECTIONS_PER_HOST` (default: `256`)
+- `OPD_DEBUG_DUMP_ENABLE` (default: `1`)
+- `OPD_DEBUG_DUMP_DIR` (default: empty -> `${STUDENT_SAVE}/distill_debug_dumps`)
+- `OPD_DEBUG_DUMP_MAX_TOTAL_MB` (default: `5120`)
+- `OPD_DEBUG_DUMP_MAX_FILES` (default: `20000`)
+- `OPD_DEBUG_DUMP_MAX_FILE_MB` (default: `64`, soft cap)
+- `OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE` (default: `8`)
+- `OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE` (default: `512`)
+- `OPD_DEBUG_DUMP_SEED` (default: `${SEED:-1234}`)
 
 Examples:
 

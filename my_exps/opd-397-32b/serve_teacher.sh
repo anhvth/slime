@@ -73,13 +73,68 @@ pick_teacher_python() {
 TEACHER_PYTHON="$(pick_teacher_python)"
 echo "[serve_teacher] using python: ${TEACHER_PYTHON}" >&2
 
+usage() {
+  cat <<'EOF'
+Usage: serve_teacher.sh [--debug] [--model <path_or_hf_id>]
+       serve_teacher.sh [--debug] [<path_or_hf_id>]
+
+Model selection precedence:
+1) CLI model argument (`--model` or positional arg)
+2) `TEACHER_MODEL` env var
+3) `MODEL` env var (compat alias)
+4) built-in defaults (debug/prod)
+EOF
+}
+
 DEBUG=0
-if [[ "${1:-}" == "--debug" ]]; then
-  DEBUG=1
-  shift
-fi
+CLI_MODEL_PATH=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --debug)
+      DEBUG=1
+      shift
+      ;;
+    --model|-m)
+      [[ $# -ge 2 ]] || {
+        echo "[serve_teacher] --model requires a value." >&2
+        usage
+        exit 1
+      }
+      CLI_MODEL_PATH="$2"
+      shift 2
+      ;;
+    --model=*)
+      CLI_MODEL_PATH="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "[serve_teacher] unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      if [[ -z "${CLI_MODEL_PATH}" ]]; then
+        CLI_MODEL_PATH="$1"
+      else
+        echo "[serve_teacher] unexpected positional argument: $1" >&2
+        usage
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
 if [[ $# -gt 0 ]]; then
-  echo "Usage: $0 [--debug]"
+  echo "[serve_teacher] unexpected trailing arguments: $*" >&2
+  usage
   exit 1
 fi
 
@@ -87,18 +142,22 @@ MODEL_HOME="${MODEL_HOME:-$HOME/ckpt/hf_models/Qwen}"
 PROD_MODEL_ID="${PROD_MODEL_ID:-Qwen/Qwen3.5-397B-A17B-FP8}"
 PROD_MODEL_DIR="${PROD_MODEL_DIR:-${MODEL_HOME}/Qwen3.5-397B-A17B-FP8}"
 DEBUG_MODEL_DIR="${DEBUG_MODEL_DIR:-${MODEL_HOME}/Qwen3-4B}"
+MODEL_ENV="${TEACHER_MODEL:-${MODEL:-}}"
 
 if [[ ${DEBUG} -eq 1 ]]; then
-  MODEL_PATH="${TEACHER_MODEL:-${DEBUG_MODEL_DIR}}"
+  MODEL_PATH="${CLI_MODEL_PATH:-${MODEL_ENV:-${DEBUG_MODEL_DIR}}}"
 else
-  if [[ -n "${TEACHER_MODEL:-}" ]]; then
-    MODEL_PATH="${TEACHER_MODEL}"
+  if [[ -n "${CLI_MODEL_PATH}" ]]; then
+    MODEL_PATH="${CLI_MODEL_PATH}"
+  elif [[ -n "${MODEL_ENV}" ]]; then
+    MODEL_PATH="${MODEL_ENV}"
   elif [[ -d "${PROD_MODEL_DIR}" ]]; then
     MODEL_PATH="${PROD_MODEL_DIR}"
   else
     MODEL_PATH="${PROD_MODEL_ID}"
   fi
 fi
+echo "[serve_teacher] using model: ${MODEL_PATH}" >&2
 
 TEACHER_HOST="${TEACHER_HOST:-0.0.0.0}"
 TEACHER_PORT="${TEACHER_PORT:-13142}"

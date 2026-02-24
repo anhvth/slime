@@ -139,6 +139,9 @@ setup_distill_mode() {
       ;;
   esac
 
+  OPD_KL_COEF="${OPD_KL_COEF:-1.0}"
+  require_float_range "${OPD_KL_COEF}" "OPD_KL_COEF" "0" "1000000"
+
   OPD_TOP_LOGPROBS_NUM="${OPD_TOP_LOGPROBS_NUM:-16}"
   require_positive_int "${OPD_TOP_LOGPROBS_NUM}" "OPD_TOP_LOGPROBS_NUM"
 
@@ -172,17 +175,46 @@ setup_distill_mode() {
   require_positive_int "${OPD_RM_RETRY_ATTEMPTS}" "OPD_RM_RETRY_ATTEMPTS"
   require_float_range "${OPD_RM_RETRY_BASE_SLEEP_S}" "OPD_RM_RETRY_BASE_SLEEP_S" "0.001" "60"
   require_float_range "${OPD_RM_RETRY_MAX_SLEEP_S}" "OPD_RM_RETRY_MAX_SLEEP_S" "0.001" "120"
+
+  OPD_DEBUG_DUMP_ENABLE="$(normalize_bool_flag "${OPD_DEBUG_DUMP_ENABLE:-1}" "OPD_DEBUG_DUMP_ENABLE")"
+  OPD_DEBUG_DUMP_DIR="${OPD_DEBUG_DUMP_DIR:-}"
+  OPD_DEBUG_DUMP_MAX_TOTAL_MB="${OPD_DEBUG_DUMP_MAX_TOTAL_MB:-5120}"
+  OPD_DEBUG_DUMP_MAX_FILES="${OPD_DEBUG_DUMP_MAX_FILES:-20000}"
+  OPD_DEBUG_DUMP_MAX_FILE_MB="${OPD_DEBUG_DUMP_MAX_FILE_MB:-64}"
+  OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE="${OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE:-8}"
+  OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE="${OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE:-512}"
+  OPD_DEBUG_DUMP_SEED="${OPD_DEBUG_DUMP_SEED:-${SEED:-1234}}"
+  require_non_negative_int "${OPD_DEBUG_DUMP_MAX_TOTAL_MB}" "OPD_DEBUG_DUMP_MAX_TOTAL_MB"
+  require_positive_int "${OPD_DEBUG_DUMP_MAX_FILES}" "OPD_DEBUG_DUMP_MAX_FILES"
+  require_positive_int "${OPD_DEBUG_DUMP_MAX_FILE_MB}" "OPD_DEBUG_DUMP_MAX_FILE_MB"
+  require_positive_int "${OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE}" "OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE"
+  require_positive_int "${OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE}" "OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE"
+  require_non_negative_int "${OPD_DEBUG_DUMP_SEED}" "OPD_DEBUG_DUMP_SEED"
 }
 
 build_distill_args() {
   DISTILL_CUSTOM_CONFIG_PATH=""
   DISTILL_ARGS=()
 
+  DISTILL_CUSTOM_CONFIG_PATH="${SCRIPT_DIR}/.distill_config_${DISTILL_LOSS_MODE}.yaml"
+  cat > "${DISTILL_CUSTOM_CONFIG_PATH}" <<EOF
+distill_loss_mode: ${DISTILL_LOSS_MODE}
+opd_debug_dump_enable: ${OPD_DEBUG_DUMP_ENABLE}
+opd_debug_dump_dir: "$(yaml_escape "${OPD_DEBUG_DUMP_DIR}")"
+opd_debug_dump_max_total_mb: ${OPD_DEBUG_DUMP_MAX_TOTAL_MB}
+opd_debug_dump_max_files: ${OPD_DEBUG_DUMP_MAX_FILES}
+opd_debug_dump_max_file_mb: ${OPD_DEBUG_DUMP_MAX_FILE_MB}
+opd_debug_dump_max_samples_per_update: ${OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE}
+opd_debug_dump_max_positions_per_sample: ${OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE}
+opd_debug_dump_seed: ${OPD_DEBUG_DUMP_SEED}
+EOF
+
   if [[ "${DISTILL_LOSS_MODE}" == "rkl" ]]; then
     DISTILL_ARGS+=(
       --use-opd
       --opd-type sglang
-      --opd-kl-coef "${OPD_KL_COEF:-1.0}"
+      --opd-kl-coef "${OPD_KL_COEF}"
+      --custom-config-path "${DISTILL_CUSTOM_CONFIG_PATH}"
       --custom-rm-path examples.on_policy_distillation.on_policy_distillation.reward_func
       --custom-reward-post-process-path examples.on_policy_distillation.on_policy_distillation.post_process_rewards
     )
@@ -194,9 +226,7 @@ build_distill_args() {
     exit 1
   }
 
-  DISTILL_CUSTOM_CONFIG_PATH="${SCRIPT_DIR}/.distill_topk_config_${DISTILL_LOSS_MODE}.yaml"
-  cat > "${DISTILL_CUSTOM_CONFIG_PATH}" <<EOF
-distill_loss_mode: ${DISTILL_LOSS_MODE}
+  cat >> "${DISTILL_CUSTOM_CONFIG_PATH}" <<EOF
 opd_top_logprobs_num: ${OPD_TOP_LOGPROBS_NUM}
 opd_mixed_kl_weight: ${OPD_MIXED_KL_WEIGHT}
 opd_distill_coef: ${OPD_DISTILL_COEF}

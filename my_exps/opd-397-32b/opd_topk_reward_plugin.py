@@ -149,6 +149,19 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_retryable_runtime_error(exc: RuntimeError) -> bool:
+    message = str(exc).strip().lower()
+    return any(
+        token in message
+        for token in (
+            "connection closed",
+            "session is closed",
+            "connector is closed",
+            "cannot write to closing transport",
+        )
+    )
+
+
 async def _get_http_session(args) -> aiohttp.ClientSession:
     global _HTTP_SESSION, _HTTP_SESSION_LOOP, _HTTP_SESSION_URL
 
@@ -258,6 +271,8 @@ async def reward_func_topk(args, sample: Sample, **kwargs):
                 if isinstance(meta_info, dict):
                     meta_info["client_http_latency"] = latency
                     meta_info["client_http_attempts"] = attempt
+                result["_opd_teacher_input_ids"] = payload["input_ids"]
+                result["_opd_teacher_logprob_start_len"] = payload["logprob_start_len"]
             return result
         except ClientError as exc:
             last_exc = exc
@@ -267,6 +282,11 @@ async def reward_func_topk(args, sample: Sample, **kwargs):
         except asyncio.TimeoutError as exc:
             last_exc = exc
             if attempt >= attempts:
+                raise
+            await _close_http_session()
+        except RuntimeError as exc:
+            last_exc = exc
+            if not _is_retryable_runtime_error(exc) or attempt >= attempts:
                 raise
             await _close_http_session()
 
@@ -292,6 +312,13 @@ def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
         )
         sample.teacher_topk_logprobs = topk_logprobs
         sample.teacher_topk_token_ids = topk_token_ids
+        if isinstance(reward, dict):
+            teacher_input_ids = reward.get("_opd_teacher_input_ids")
+            if isinstance(teacher_input_ids, list):
+                sample.teacher_input_ids = [int(x) for x in teacher_input_ids]
+            teacher_logprob_start_len = reward.get("_opd_teacher_logprob_start_len")
+            if teacher_logprob_start_len is not None:
+                sample.teacher_logprob_start_len = int(teacher_logprob_start_len)
 
     scalar_rewards = [0.0] * len(samples)
     return scalar_rewards, scalar_rewards

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from argparse import Namespace
 
 import torch
@@ -7,6 +8,14 @@ import torch.distributed as dist
 from megatron.core import mpu
 
 from slime.backends.megatron_utils.loss import get_responses
+
+try:
+    from opd_debug_dump import dump_topk_debug_update
+except Exception:  # pragma: no cover - keep training resilient if plugin path is unavailable
+    dump_topk_debug_update = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def compute_topk_renormalized_jsd(
@@ -157,6 +166,10 @@ def distill_topk_custom_loss(
     per_token_reverse: list[torch.Tensor] = []
     per_token_jsd: list[torch.Tensor] | None = [] if mode == "jsd" else None
     topk_values: list[int] = []
+    debug_records: list[dict] = []
+    sample_indices = batch.get("sample_indices")
+    teacher_input_ids = batch.get("teacher_input_ids")
+    teacher_logprob_start_len = batch.get("teacher_logprob_start_len")
 
     for i, (logits_chunk, _) in enumerate(
         get_responses(
@@ -189,16 +202,55 @@ def distill_topk_custom_loss(
         topk_values.append(int(teacher_lp.size(1)))
 
         student_lp = _gather_selected_logprobs_tp(logits_chunk, teacher_ids)
-        teacher_probs = teacher_lp.exp()
-        student_probs = student_lp.exp()
 
-        forward_kl = (teacher_probs * (teacher_lp - student_lp)).sum(dim=-1)
-        reverse_kl = (student_probs * (student_lp - teacher_lp)).sum(dim=-1)
+        # Renormalize both distributions to the top-k support so that the
+        # backward gradient through logsumexp becomes zero-sum.  Without this,
+        # FKL creates a dense shift gradient across all V vocab logits (the
+        # "mass_topk · softmax" term), inflating grad-norm by ~O(sqrt(V/K)).
+        teacher_lp_norm = teacher_lp - torch.logsumexp(teacher_lp, dim=-1, keepdim=True)
+        student_lp_norm = student_lp - torch.logsumexp(student_lp, dim=-1, keepdim=True)
+
+        teacher_probs = teacher_lp_norm.exp()
+        student_probs = student_lp_norm.exp()
+
+        forward_kl = (teacher_probs * (teacher_lp_norm - student_lp_norm)).sum(dim=-1)
+        reverse_kl = (student_probs * (student_lp_norm - teacher_lp_norm)).sum(dim=-1)
+        jsd = None
         per_token_forward.append(forward_kl)
         per_token_reverse.append(reverse_kl)
         if per_token_jsd is not None:
             jsd = compute_topk_renormalized_jsd(teacher_lp, student_lp, beta=jsd_beta)
             per_token_jsd.append(jsd)
+
+        sample_tokens = batch["unconcat_tokens"][i]
+        response_len = int(teacher_lp.size(0))
+        total_len = int(sample_tokens.size(0)) if hasattr(sample_tokens, "size") else len(sample_tokens)
+        response_start = int(total_len - response_len)
+        debug_records.append(
+            {
+                "sample_index": sample_indices[i] if sample_indices is not None else -1,
+                "microbatch_sample_index": i,
+                "student_input_ids": sample_tokens,
+                "response_start": response_start,
+                "response_length": response_len,
+                "teacher_input_ids": teacher_input_ids[i] if teacher_input_ids is not None else None,
+                "teacher_logprob_start_len": (
+                    teacher_logprob_start_len[i] if teacher_logprob_start_len is not None else None
+                ),
+                "teacher_topk_logprobs": teacher_lp,
+                "teacher_topk_token_ids": teacher_ids,
+                "student_topk_logprobs": student_lp,
+                "forward_kl": forward_kl,
+                "reverse_kl": reverse_kl,
+                "jsd": jsd,
+            }
+        )
+
+    if dump_topk_debug_update is not None and debug_records:
+        try:
+            dump_topk_debug_update(args, mode=mode, records=debug_records)
+        except Exception:
+            logger.warning("Failed to save top-k distillation debug dump.", exc_info=True)
 
     if not per_token_forward:
         zero = 0.0 * logits.sum()

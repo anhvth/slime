@@ -390,6 +390,10 @@ class RolloutManager:
 
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+        if samples[0].teacher_input_ids is not None:
+            train_data["teacher_input_ids"] = [sample.teacher_input_ids for sample in samples]
+        if samples[0].teacher_logprob_start_len is not None:
+            train_data["teacher_logprob_start_len"] = [sample.teacher_logprob_start_len for sample in samples]
         if samples[0].teacher_topk_logprobs is not None:
             train_data["teacher_topk_logprobs"] = [sample.teacher_topk_logprobs for sample in samples]
         if samples[0].teacher_topk_token_ids is not None:
@@ -434,6 +438,8 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_input_ids",
+                "teacher_logprob_start_len",
                 "teacher_topk_logprobs",
                 "teacher_topk_token_ids",
             ]:

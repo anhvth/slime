@@ -163,3 +163,32 @@ def test_custom_privileged_tags(monkeypatch) -> None:
     assert captured["text"] == "\n<CTX>\nMETA_INFO\n</CTX>\n"
     assert input_ids == [101, 102, 777, 201, 202]
     assert start_len == 3
+
+
+def test_post_process_records_teacher_view_for_debug() -> None:
+    args = _make_args(opd_top_logprobs_num=2)
+    reward = {
+        "meta_info": {
+            "input_top_logprobs": [
+                [[-0.1, 10, None], [-0.2, 11, None]],
+                [[-0.3, 12, None], [-0.4, 13, None]],
+            ]
+        },
+        "_opd_teacher_input_ids": [1, 2, 3, 4],
+        "_opd_teacher_logprob_start_len": 2,
+    }
+    sample = SimpleNamespace(
+        response_length=2,
+        teacher_topk_logprobs=None,
+        teacher_topk_token_ids=None,
+        teacher_input_ids=None,
+        teacher_logprob_start_len=None,
+    )
+    sample.get_reward_value = lambda _args: reward
+
+    reward_plugin.post_process_rewards_topk(args, [sample])
+
+    assert sample.teacher_topk_logprobs == [[-0.1, -0.2], [-0.3, -0.4]]
+    assert sample.teacher_topk_token_ids == [[10, 11], [12, 13]]
+    assert sample.teacher_input_ids == [1, 2, 3, 4]
+    assert sample.teacher_logprob_start_len == 2

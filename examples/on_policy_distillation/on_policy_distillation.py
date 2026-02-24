@@ -51,6 +51,8 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
 
     for sample, t_log_probs in zip(samples, teacher_log_probs, strict=False):
         sample.teacher_log_probs = t_log_probs
+        sample.teacher_input_ids = [int(t) for t in sample.tokens]
+        sample.teacher_logprob_start_len = 0
 
     # Return scalar rewards for GRPO/PPO advantage estimator
     # For pure on-policy distillation, we use 0.0 as the task reward.

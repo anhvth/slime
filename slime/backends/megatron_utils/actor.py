@@ -358,6 +358,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         if self.args.offload_train:
             self.wake_up()
+        self.args.opd_debug_rollout_id = rollout_id
 
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)

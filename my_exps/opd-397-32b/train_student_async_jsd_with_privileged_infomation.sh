@@ -106,10 +106,23 @@ wait_http_healthy() {
 export RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://100.96.4.38:8265}"
 export TEACHER_URL="${TEACHER_URL:-http://worker-30:13142/generate}"
 
-export RESUME_MODEL_ROOT="${RESUME_MODEL_ROOT:-$HOME/home-trained-model/onpolicy-distill-qwen3.5-step1600}"
-export RESUME_SAVE_TAG="${RESUME_SAVE_TAG:-onpolicy-distill-qwen3.5-step1600}"
-export RESUME_HF_DIR="${RESUME_HF_DIR:-${RESUME_MODEL_ROOT}/hf}"
-export RESUME_DIST_DIR="${RESUME_DIST_DIR:-${RESUME_MODEL_ROOT}/dist}"
+export RESUME_MODEL_ROOT="${RESUME_MODEL_ROOT:-$HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned}"
+DEFAULT_RESUME_BASENAME="$(basename "${RESUME_MODEL_ROOT%/}")"
+export RESUME_SAVE_TAG="${RESUME_SAVE_TAG:-${DEFAULT_RESUME_BASENAME}}"
+if [[ -z "${RESUME_HF_DIR:-}" ]]; then
+  if [[ -f "${RESUME_MODEL_ROOT%/}/config.json" ]]; then
+    export RESUME_HF_DIR="${RESUME_MODEL_ROOT%/}"
+  else
+    export RESUME_HF_DIR="${RESUME_MODEL_ROOT%/}/hf"
+  fi
+fi
+if [[ -z "${RESUME_DIST_DIR:-}" ]]; then
+  if [[ -d "${RESUME_MODEL_ROOT%/}_torch_dist" ]]; then
+    export RESUME_DIST_DIR="${RESUME_MODEL_ROOT%/}_torch_dist"
+  else
+    export RESUME_DIST_DIR="${RESUME_MODEL_ROOT%/}/dist"
+  fi
+fi
 
 export PROMPT_DATA="${PROMPT_DATA:-${REPO_ROOT}/datasets/50k_prompt_for_distillation_privileged.jsonl}"
 export STUDENT_HF_CHECKPOINT="${STUDENT_HF_CHECKPOINT:-${RESUME_HF_DIR}}"
@@ -122,7 +135,7 @@ export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-6}"
 export ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
 export ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-72}"
 export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-8}"
-export ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-1536}"
+export ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-4096}"
 
 # Reward HTTP client tuning for high-concurrency teacher calls.
 export OPD_RM_CONNECT_TIMEOUT_S="${OPD_RM_CONNECT_TIMEOUT_S:-2.0}"
