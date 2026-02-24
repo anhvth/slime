@@ -1,0 +1,17 @@
+distill_loss_mode: jsd
+opd_top_logprobs_num: 16
+opd_mixed_kl_weight: 0.5
+opd_distill_coef: 1.0
+opd_privileged_enable: 1
+opd_privileged_metadata_key: "privileged_context"
+opd_privileged_fallback_label: 1
+opd_privileged_tokenizer_path: "/home/anhvth8/home-trained-model/onpolicy-distill-qwen3.5-step1600/hf"
+opd_rm_connect_timeout_s: 2.0
+opd_rm_read_timeout_s: 120.0
+opd_rm_total_timeout_s: 180.0
+opd_rm_max_connections: 512
+opd_rm_max_connections_per_host: 256
+opd_rm_retry_attempts: 6
+opd_rm_retry_base_sleep_s: 0.15
+opd_rm_retry_max_sleep_s: 2.0
+opd_jsd_beta: 0.5
