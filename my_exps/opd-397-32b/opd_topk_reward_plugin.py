@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from functools import lru_cache
 
 import aiohttp
+from aiohttp import ClientError
 from transformers import AutoTokenizer
 
 from slime.utils.types import Sample
 
 from opd_topk_parser import extract_topk_from_reward
+
+_HTTP_SESSION: aiohttp.ClientSession | None = None
+_HTTP_SESSION_LOOP: asyncio.AbstractEventLoop | None = None
+_HTTP_SESSION_URL: str | None = None
 
 
 def _get_topk(args) -> int:
@@ -86,6 +93,98 @@ def _get_tokenizer(tokenizer_path: str):
     return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
 
+def _get_float_option(args, name: str, default: float) -> float:
+    value = getattr(args, name, default)
+    if value is None:
+        return default
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _get_int_option(args, name: str, default: int) -> int:
+    value = getattr(args, name, default)
+    if value is None:
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+async def _close_http_session() -> None:
+    global _HTTP_SESSION, _HTTP_SESSION_LOOP, _HTTP_SESSION_URL
+    if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
+        try:
+            await _HTTP_SESSION.close()
+        except RuntimeError:
+            pass
+    _HTTP_SESSION = None
+    _HTTP_SESSION_LOOP = None
+    _HTTP_SESSION_URL = None
+
+
+def _is_retryable_http_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+            aiohttp.ClientOSError,
+            asyncio.TimeoutError,
+        ),
+    ):
+        return True
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status in {408, 409, 425, 429, 500, 502, 503, 504}
+    return False
+
+
+async def _get_http_session(args) -> aiohttp.ClientSession:
+    global _HTTP_SESSION, _HTTP_SESSION_LOOP, _HTTP_SESSION_URL
+
+    loop = asyncio.get_running_loop()
+    rm_url = str(getattr(args, "rm_url", "") or "").strip()
+    must_recreate = (
+        _HTTP_SESSION is None
+        or _HTTP_SESSION.closed
+        or _HTTP_SESSION_LOOP is not loop
+        or _HTTP_SESSION_URL != rm_url
+    )
+    if not must_recreate:
+        return _HTTP_SESSION
+
+    if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
+        await _close_http_session()
+
+    connect_timeout = _get_float_option(args, "opd_rm_connect_timeout_s", 2.0)
+    sock_read_timeout = _get_float_option(args, "opd_rm_read_timeout_s", 120.0)
+    total_timeout = _get_float_option(args, "opd_rm_total_timeout_s", 180.0)
+    max_connections = _get_int_option(args, "opd_rm_max_connections", 512)
+    max_connections_per_host = _get_int_option(args, "opd_rm_max_connections_per_host", 256)
+
+    timeout = aiohttp.ClientTimeout(
+        total=total_timeout,
+        connect=connect_timeout,
+        sock_connect=connect_timeout,
+        sock_read=sock_read_timeout,
+    )
+    connector = aiohttp.TCPConnector(
+        limit=max_connections,
+        limit_per_host=max_connections_per_host,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+    _HTTP_SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    _HTTP_SESSION_LOOP = loop
+    _HTTP_SESSION_URL = rm_url
+    return _HTTP_SESSION
+
+
 def _build_teacher_input_ids_and_start_len(args, sample: Sample) -> tuple[list[int], int]:
     prompt_len = len(sample.tokens) - sample.response_length
     if prompt_len < 0:
@@ -108,14 +207,15 @@ def _build_teacher_input_ids_and_start_len(args, sample: Sample) -> tuple[list[i
     if privileged_context is None:
         return prompt_ids + response_ids, len(prompt_ids)
 
-    open_tag = str(getattr(args, "opd_privileged_open_tag", "[PRIVILEGED_CONTEXT]") or "[PRIVILEGED_CONTEXT]")
-    close_tag = str(
-        getattr(args, "opd_privileged_close_tag", "[/PRIVILEGED_CONTEXT]") or "[/PRIVILEGED_CONTEXT]"
-    )
-    suffix = f"\n{open_tag}\n{privileged_context}\n{close_tag}\n"
-
     tokenizer = _get_tokenizer(_get_tokenizer_path(args))
-    privileged_ids = [int(tid) for tid in tokenizer.encode(suffix, add_special_tokens=False)]
+    # Render as a proper system message so the teacher sees it in a format
+    # consistent with its chat training (e.g. <|im_start|>system\n...<|im_end|>).
+    privileged_text = tokenizer.apply_chat_template(
+        [{"role": "system", "content": privileged_context}],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    privileged_ids = [int(tid) for tid in tokenizer.encode(privileged_text, add_special_tokens=False)]
     scored_prompt_ids = prompt_ids + privileged_ids
     return scored_prompt_ids + response_ids, len(scored_prompt_ids)
 
@@ -138,12 +238,42 @@ def _build_teacher_payload(args, sample: Sample, topk: int) -> dict:
 async def reward_func_topk(args, sample: Sample, **kwargs):
     topk = _get_topk(args)
     payload = _build_teacher_payload(args, sample, topk)
+    attempts = _get_int_option(args, "opd_rm_retry_attempts", 5)
+    base_sleep = _get_float_option(args, "opd_rm_retry_base_sleep_s", 0.15)
+    max_sleep = _get_float_option(args, "opd_rm_retry_max_sleep_s", 2.0)
 
-    session_kwargs = {}
-    async with aiohttp.ClientSession(**session_kwargs) as session:
-        async with session.post(args.rm_url, json=payload) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+    start = time.perf_counter()
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            session = await _get_http_session(args)
+            async with session.post(args.rm_url, json=payload) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+            latency = time.perf_counter() - start
+            if isinstance(result, dict):
+                meta_info = result.get("meta_info")
+                if isinstance(meta_info, dict):
+                    meta_info["client_http_latency"] = latency
+                    meta_info["client_http_attempts"] = attempt
+            return result
+        except ClientError as exc:
+            last_exc = exc
+            if not _is_retryable_http_error(exc) or attempt >= attempts:
+                raise
+            await _close_http_session()
+        except asyncio.TimeoutError as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                raise
+            await _close_http_session()
+
+        sleep_s = min(max_sleep, base_sleep * (2 ** (attempt - 1)))
+        await asyncio.sleep(sleep_s)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Teacher request failed without exception details.")
 
 
 def post_process_rewards_topk(args, samples: list[Sample], **kwargs):

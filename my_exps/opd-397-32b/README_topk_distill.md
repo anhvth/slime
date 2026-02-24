@@ -67,6 +67,11 @@ Set these env vars when running `my_exps/opd-397-32b/train_student_async_distill
 - `OPD_PRIVILEGED_OPEN_TAG` (default: `[PRIVILEGED_CONTEXT]`)
 - `OPD_PRIVILEGED_CLOSE_TAG` (default: `[/PRIVILEGED_CONTEXT]`)
 - `OPD_PRIVILEGED_TOKENIZER_PATH` (default: empty; fallback to `--hf-checkpoint`)
+- `OPD_RM_CONNECT_TIMEOUT_S` (default: `2.0`)
+- `OPD_RM_READ_TIMEOUT_S` (default: `120.0`)
+- `OPD_RM_TOTAL_TIMEOUT_S` (default: `180.0`)
+- `OPD_RM_MAX_CONNECTIONS` (default: `512`)
+- `OPD_RM_MAX_CONNECTIONS_PER_HOST` (default: `256`)
 
 Examples:
 
@@ -171,3 +176,49 @@ The custom loss logs:
 - `train/distill_jsd`
 - `train/distill_mode` (`1=fkl`, `2=mixed`, `3=jsd`)
 - `train/distill_topk`
+
+## Performance debugging runbook
+
+Use these tools while privileged JSD training is running:
+
+1. Continuous health + bottleneck monitor (tmux-friendly):
+
+```bash
+bash my_exps/opd-397-32b/monitor_privileged_training.sh
+```
+
+Useful env overrides:
+
+- `ENABLE_PERF_PROBE=1` (default)
+- `PERF_PROBE_EVERY_LOOPS=6` (emit perf analysis every ~3 min at 30s loop)
+- `GPU_SNAPSHOT_EVERY_LOOPS=12`
+- `PERF_ALERT_WAIT_RATIO=0.65`
+- `PERF_ALERT_TPS=180`
+- `PERF_ALERT_TEACHER_P95=10`
+
+2. One-shot detailed report with artifacts:
+
+```bash
+bash my_exps/opd-397-32b/perf_tools/run_perf_report.sh
+```
+
+Outputs:
+
+- `my_exps/opd-397-32b/logs/perf_reports/<timestamp>/summary.md`
+- `.../training_perf.txt`, `.../training_perf.json`
+- `.../ray_gpu_snapshot.txt`, `.../ray_gpu_snapshot.json`
+
+3. Quick direct analyzer call:
+
+```bash
+python3 my_exps/opd-397-32b/perf_tools/analyze_training_perf.py \
+  --log my_exps/opd-397-32b/logs/training_async_distill_active.log \
+  --tail-lines 8000
+```
+
+Interpretation guide:
+
+- `wait_time_ratio` high (`>=0.65`) => train side is waiting on rollout/reward path.
+- `tokens_per_gpu_per_sec` low (`<180`) + `token usage` near zero => rollout engines under-filled.
+- `teacher_e2e_latency p95` high (`>10s`) => teacher endpoint tail latency bottleneck.
+- `truncated_ratio` high (`>0.6`) => many responses hit max length (costly rollout).

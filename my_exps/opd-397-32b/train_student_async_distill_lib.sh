@@ -154,9 +154,24 @@ setup_distill_mode() {
   OPD_PRIVILEGED_ENABLE="$(normalize_bool_flag "${OPD_PRIVILEGED_ENABLE:-0}" "OPD_PRIVILEGED_ENABLE")"
   OPD_PRIVILEGED_METADATA_KEY="${OPD_PRIVILEGED_METADATA_KEY:-privileged_context}"
   OPD_PRIVILEGED_FALLBACK_LABEL="$(normalize_bool_flag "${OPD_PRIVILEGED_FALLBACK_LABEL:-1}" "OPD_PRIVILEGED_FALLBACK_LABEL")"
-  OPD_PRIVILEGED_OPEN_TAG="${OPD_PRIVILEGED_OPEN_TAG:-[PRIVILEGED_CONTEXT]}"
-  OPD_PRIVILEGED_CLOSE_TAG="${OPD_PRIVILEGED_CLOSE_TAG:-[/PRIVILEGED_CONTEXT]}"
   OPD_PRIVILEGED_TOKENIZER_PATH="${OPD_PRIVILEGED_TOKENIZER_PATH:-}"
+
+  OPD_RM_CONNECT_TIMEOUT_S="${OPD_RM_CONNECT_TIMEOUT_S:-2.0}"
+  OPD_RM_READ_TIMEOUT_S="${OPD_RM_READ_TIMEOUT_S:-120.0}"
+  OPD_RM_TOTAL_TIMEOUT_S="${OPD_RM_TOTAL_TIMEOUT_S:-180.0}"
+  OPD_RM_MAX_CONNECTIONS="${OPD_RM_MAX_CONNECTIONS:-512}"
+  OPD_RM_MAX_CONNECTIONS_PER_HOST="${OPD_RM_MAX_CONNECTIONS_PER_HOST:-256}"
+  OPD_RM_RETRY_ATTEMPTS="${OPD_RM_RETRY_ATTEMPTS:-6}"
+  OPD_RM_RETRY_BASE_SLEEP_S="${OPD_RM_RETRY_BASE_SLEEP_S:-0.15}"
+  OPD_RM_RETRY_MAX_SLEEP_S="${OPD_RM_RETRY_MAX_SLEEP_S:-2.0}"
+  require_float_range "${OPD_RM_CONNECT_TIMEOUT_S}" "OPD_RM_CONNECT_TIMEOUT_S" "0.001" "3600"
+  require_float_range "${OPD_RM_READ_TIMEOUT_S}" "OPD_RM_READ_TIMEOUT_S" "0.001" "7200"
+  require_float_range "${OPD_RM_TOTAL_TIMEOUT_S}" "OPD_RM_TOTAL_TIMEOUT_S" "0.001" "7200"
+  require_positive_int "${OPD_RM_MAX_CONNECTIONS}" "OPD_RM_MAX_CONNECTIONS"
+  require_positive_int "${OPD_RM_MAX_CONNECTIONS_PER_HOST}" "OPD_RM_MAX_CONNECTIONS_PER_HOST"
+  require_positive_int "${OPD_RM_RETRY_ATTEMPTS}" "OPD_RM_RETRY_ATTEMPTS"
+  require_float_range "${OPD_RM_RETRY_BASE_SLEEP_S}" "OPD_RM_RETRY_BASE_SLEEP_S" "0.001" "60"
+  require_float_range "${OPD_RM_RETRY_MAX_SLEEP_S}" "OPD_RM_RETRY_MAX_SLEEP_S" "0.001" "120"
 }
 
 build_distill_args() {
@@ -188,9 +203,15 @@ opd_distill_coef: ${OPD_DISTILL_COEF}
 opd_privileged_enable: ${OPD_PRIVILEGED_ENABLE}
 opd_privileged_metadata_key: "$(yaml_escape "${OPD_PRIVILEGED_METADATA_KEY}")"
 opd_privileged_fallback_label: ${OPD_PRIVILEGED_FALLBACK_LABEL}
-opd_privileged_open_tag: "$(yaml_escape "${OPD_PRIVILEGED_OPEN_TAG}")"
-opd_privileged_close_tag: "$(yaml_escape "${OPD_PRIVILEGED_CLOSE_TAG}")"
 opd_privileged_tokenizer_path: "$(yaml_escape "${OPD_PRIVILEGED_TOKENIZER_PATH}")"
+opd_rm_connect_timeout_s: ${OPD_RM_CONNECT_TIMEOUT_S}
+opd_rm_read_timeout_s: ${OPD_RM_READ_TIMEOUT_S}
+opd_rm_total_timeout_s: ${OPD_RM_TOTAL_TIMEOUT_S}
+opd_rm_max_connections: ${OPD_RM_MAX_CONNECTIONS}
+opd_rm_max_connections_per_host: ${OPD_RM_MAX_CONNECTIONS_PER_HOST}
+opd_rm_retry_attempts: ${OPD_RM_RETRY_ATTEMPTS}
+opd_rm_retry_base_sleep_s: ${OPD_RM_RETRY_BASE_SLEEP_S}
+opd_rm_retry_max_sleep_s: ${OPD_RM_RETRY_MAX_SLEEP_S}
 EOF
 
   if [[ "${DISTILL_LOSS_MODE}" == "jsd" ]]; then

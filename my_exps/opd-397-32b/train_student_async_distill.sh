@@ -18,6 +18,101 @@ LIB_SCRIPT="${SCRIPT_DIR}/train_student_async_distill_lib.sh"
 # shellcheck source=/dev/null
 source "${LIB_SCRIPT}"
 
+require_cmd() {
+  local cmd="$1"
+  command -v "${cmd}" >/dev/null 2>&1 || {
+    echo "Missing required command: ${cmd}" >&2
+    exit 1
+  }
+}
+
+require_dir() {
+  local path="$1"
+  local message="$2"
+  [[ -d "${path}" ]] || {
+    echo "${message}: ${path}" >&2
+    exit 1
+  }
+}
+
+validate_hf_checkpoint_dir() {
+  local hf_dir="$1"
+  require_dir "${hf_dir}" "Missing student HF checkpoint directory"
+  require_file "${hf_dir}/config.json" "Missing student HF config"
+  if [[ ! -f "${hf_dir}/model.safetensors.index.json" && ! -f "${hf_dir}/model.safetensors" \
+     && ! -f "${hf_dir}/pytorch_model.bin.index.json" && ! -f "${hf_dir}/pytorch_model.bin" ]]; then
+    echo "HF checkpoint appears incomplete: missing model index/weights under ${hf_dir}" >&2
+    exit 1
+  fi
+}
+
+validate_torch_dist_dir() {
+  local dist_dir="$1"
+  local name="$2"
+  local payload_dir=""
+
+  require_dir "${dist_dir}" "Missing ${name} torch_dist directory"
+  if ! payload_dir="$(resolve_torch_dist_payload_dir "${dist_dir}")"; then
+    echo "Missing ${name} torch_dist manifest: ${dist_dir}/common.pt (or release/iter_*/common.pt)" >&2
+    exit 1
+  fi
+  if [[ ! -f "${payload_dir}/.metadata" && ! -f "${payload_dir}/metadata.json" ]]; then
+    echo "${name} torch_dist appears incomplete: missing .metadata/metadata.json in ${payload_dir}" >&2
+    exit 1
+  fi
+}
+
+resolve_torch_dist_payload_dir() {
+  local root="$1"
+  local marker=""
+  local candidate=""
+
+  if [[ -f "${root}/common.pt" ]]; then
+    printf '%s\n' "${root}"
+    return 0
+  fi
+
+  if [[ -f "${root}/latest_checkpointed_iteration.txt" ]]; then
+    marker="$(tr -d '[:space:]' < "${root}/latest_checkpointed_iteration.txt" || true)"
+    if [[ -n "${marker}" && -f "${root}/${marker}/common.pt" ]]; then
+      printf '%s\n' "${root}/${marker}"
+      return 0
+    fi
+  fi
+
+  for candidate in "${root}/release" "${root}"/iter_*; do
+    [[ -d "${candidate}" ]] || continue
+    if [[ -f "${candidate}/common.pt" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+wait_http_healthy() {
+  local url="$1"
+  local name="$2"
+  local max_attempts="${3:-15}"
+  local sleep_seconds="${4:-2}"
+  local connect_timeout="${TEACHER_CONNECT_TIMEOUT:-2}"
+  local max_time="${TEACHER_MAX_TIME:-8}"
+  local attempt
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if curl -sf --connect-timeout "${connect_timeout}" --max-time "${max_time}" "${url}" >/dev/null; then
+      return 0
+    fi
+    if (( attempt < max_attempts )); then
+      sleep "${sleep_seconds}"
+    fi
+  done
+
+  echo "Teacher preflight failed after ${max_attempts} attempts: ${name} (${url})" >&2
+  exit 1
+}
+
 cd "${REPO_ROOT}"
 
 mkdir -p "${SCRIPT_DIR}/logs"
@@ -39,6 +134,8 @@ source "${MODEL_CONFIG_SCRIPT}"
 
 TRAIN_PY_PATH="${TRAIN_PY_PATH:-${REPO_ROOT}/train_async.py}"
 require_file "${TRAIN_PY_PATH}" "Missing train entrypoint"
+require_cmd ray
+require_cmd curl
 
 STUDENT_HF_CHECKPOINT_PATH="${STUDENT_HF_CHECKPOINT:-${STUDENT_HF_DEFAULT}}"
 STUDENT_HF_CHECKPOINT_PATH="${STUDENT_HF_CHECKPOINT_PATH%/}"
@@ -56,6 +153,12 @@ fi
 mkdir -p "${OUTPUT_ROOT}"
 PROMPT_DATA_PATH="${PROMPT_DATA:-${REPO_ROOT}/datasets/200k_prompt_for_distillation.jsonl}"
 require_file "${PROMPT_DATA_PATH}" "Missing prompt dataset"
+if ! [[ -s "${PROMPT_DATA_PATH}" ]]; then
+  echo "Prompt dataset is empty: ${PROMPT_DATA_PATH}" >&2
+  exit 1
+fi
+
+validate_hf_checkpoint_dir "${STUDENT_HF_CHECKPOINT_PATH}"
 
 ENSURE_REF_MODEL_SCRIPT="${SCRIPT_DIR}/ensure_ref_model.sh"
 require_file "${ENSURE_REF_MODEL_SCRIPT}" "Missing ref model helper script"
@@ -65,6 +168,10 @@ bash "${ENSURE_REF_MODEL_SCRIPT}" \
   --hf-checkpoint "${STUDENT_HF_CHECKPOINT_PATH}" \
   --ref-load "${STUDENT_REF_LOAD_PATH}" \
   --megatron-pythonpath "${MEGATRON_PYTHONPATH:-/root/Megatron-LM}"
+validate_torch_dist_dir "${STUDENT_REF_LOAD_PATH}" "ref-load"
+if [[ -n "${STUDENT_LOAD_PATH}" ]]; then
+  validate_torch_dist_dir "${STUDENT_LOAD_PATH}" "load"
+fi
 
 MAX_CHECKPOINTS_TO_KEEP="${MAX_CHECKPOINTS_TO_KEEP:-5}"
 CHECKPOINT_PRUNE_INTERVAL_SEC="${CHECKPOINT_PRUNE_INTERVAL_SEC:-300}"
@@ -74,18 +181,23 @@ require_non_negative_int "${MAX_CHECKPOINTS_TO_KEEP}" "MAX_CHECKPOINTS_TO_KEEP"
 require_positive_int "${CHECKPOINT_PRUNE_INTERVAL_SEC}" "CHECKPOINT_PRUNE_INTERVAL_SEC"
 
 TEACHER_HOST="${TEACHER_HOST:-worker-30}"
-TEACHER_PORT="${TEACHER_PORT:-13141}"
+TEACHER_PORT="${TEACHER_PORT:-13142}"
 TEACHER_URL="${TEACHER_URL:-http://${TEACHER_HOST}:${TEACHER_PORT}/generate}"
 TEACHER_BASE="${TEACHER_URL%/generate}"
 [[ "${TEACHER_BASE}" != "${TEACHER_URL}" ]] || { echo "TEACHER_URL must end with /generate" >&2; exit 1; }
 
-curl -sf "${TEACHER_BASE}/health_generate" >/dev/null
-curl -sf "${TEACHER_BASE}/get_model_info" >/dev/null
-
-setup_distill_mode
-
 RAY_JOB_ADDRESS="$(require_ray_job_address)"
 echo "Using Ray Job server: ${RAY_JOB_ADDRESS}"
+
+TEACHER_HEALTH_MAX_ATTEMPTS="${TEACHER_HEALTH_MAX_ATTEMPTS:-15}"
+TEACHER_HEALTH_RETRY_SEC="${TEACHER_HEALTH_RETRY_SEC:-2}"
+require_positive_int "${TEACHER_HEALTH_MAX_ATTEMPTS}" "TEACHER_HEALTH_MAX_ATTEMPTS"
+require_positive_int "${TEACHER_HEALTH_RETRY_SEC}" "TEACHER_HEALTH_RETRY_SEC"
+
+wait_http_healthy "${TEACHER_BASE}/health_generate" "health_generate" "${TEACHER_HEALTH_MAX_ATTEMPTS}" "${TEACHER_HEALTH_RETRY_SEC}"
+wait_http_healthy "${TEACHER_BASE}/get_model_info" "get_model_info" "${TEACHER_HEALTH_MAX_ATTEMPTS}" "${TEACHER_HEALTH_RETRY_SEC}"
+
+setup_distill_mode
 
 # Opinionated async layout for a 120-GPU cluster (15x8): 56 train (7 nodes) + 64 rollout (8 nodes).
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-7}"

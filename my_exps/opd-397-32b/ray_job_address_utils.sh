@@ -37,4 +37,6 @@ require_ray_job_address() {
 
   printf '%s\n' "${addr}"
 }
-resolve_ray_job_address
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  resolve_ray_job_address
+fi
