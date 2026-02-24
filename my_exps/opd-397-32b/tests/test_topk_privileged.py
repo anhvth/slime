@@ -21,6 +21,8 @@ def _make_args(**kwargs) -> Namespace:
         "opd_privileged_enable": 1,
         "opd_privileged_metadata_key": "privileged_context",
         "opd_privileged_fallback_label": 1,
+        "opd_privileged_open_tag": "[PRIVILEGED_CONTEXT]",
+        "opd_privileged_close_tag": "[/PRIVILEGED_CONTEXT]",
         "opd_privileged_tokenizer_path": "",
         "hf_checkpoint": "/tmp/fake_hf_path",
     }
@@ -36,12 +38,6 @@ def test_privileged_metadata_takes_precedence_over_label(monkeypatch) -> None:
     captured = {}
 
     class DummyTokenizer:
-        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-            captured["messages"] = messages
-            assert tokenize is False
-            assert add_generation_prompt is False
-            return "<|im_start|>system\nMETA_INFO<|im_end|>"
-
         def encode(self, text, add_special_tokens=False):
             captured["text"] = text
             assert add_special_tokens is False
@@ -59,7 +55,7 @@ def test_privileged_metadata_takes_precedence_over_label(monkeypatch) -> None:
     input_ids, start_len = reward_plugin._build_teacher_input_ids_and_start_len(args, sample)
 
     assert captured["path"] == "/tmp/fake_hf_path"
-    assert captured["messages"] == [{"role": "system", "content": "META_INFO"}]
+    assert captured["text"] == "\n[PRIVILEGED_CONTEXT]\nMETA_INFO\n[/PRIVILEGED_CONTEXT]\n"
     assert input_ids == [101, 102, 900, 901, 201, 202]
     assert start_len == 4
 
@@ -68,10 +64,6 @@ def test_fallback_to_label_when_metadata_missing(monkeypatch) -> None:
     captured = {}
 
     class DummyTokenizer:
-        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-            captured["messages"] = messages
-            return "<|im_start|>system\nLABEL_ONLY<|im_end|>"
-
         def encode(self, text, add_special_tokens=False):
             captured["text"] = text
             return [910]
@@ -83,7 +75,7 @@ def test_fallback_to_label_when_metadata_missing(monkeypatch) -> None:
 
     input_ids, start_len = reward_plugin._build_teacher_input_ids_and_start_len(args, sample)
 
-    assert captured["messages"] == [{"role": "system", "content": "LABEL_ONLY"}]
+    assert captured["text"] == "\n[PRIVILEGED_CONTEXT]\nLABEL_ONLY\n[/PRIVILEGED_CONTEXT]\n"
     assert input_ids == [101, 102, 910, 201, 202]
     assert start_len == 3
 
@@ -120,9 +112,6 @@ def test_privileged_disabled_uses_prompt_only(monkeypatch) -> None:
 
 def test_payload_composition_with_privileged_context(monkeypatch) -> None:
     class DummyTokenizer:
-        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-            return "<|im_start|>system\nCTX<|im_end|>"
-
         def encode(self, text, add_special_tokens=False):
             return [333, 334, 335]
 
@@ -154,3 +143,23 @@ def test_payload_composition_without_privileged_context(monkeypatch) -> None:
     assert payload["top_logprobs_num"] == 16
     assert payload["logprob_start_len"] == 2
     assert payload["input_ids"] == [101, 102, 201, 202]
+
+
+def test_custom_privileged_tags(monkeypatch) -> None:
+    captured = {}
+
+    class DummyTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            captured["text"] = text
+            return [777]
+
+    monkeypatch.setattr(reward_plugin, "_get_tokenizer", lambda _: DummyTokenizer())
+
+    args = _make_args(opd_privileged_open_tag="<CTX>", opd_privileged_close_tag="</CTX>")
+    sample = _make_sample(metadata={"privileged_context": "META_INFO"}, label=None)
+
+    input_ids, start_len = reward_plugin._build_teacher_input_ids_and_start_len(args, sample)
+
+    assert captured["text"] == "\n<CTX>\nMETA_INFO\n</CTX>\n"
+    assert input_ids == [101, 102, 777, 201, 202]
+    assert start_len == 3

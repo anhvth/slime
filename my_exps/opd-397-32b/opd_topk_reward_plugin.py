@@ -93,6 +93,11 @@ def _get_tokenizer(tokenizer_path: str):
     return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
 
+def _get_privileged_tag(args, name: str, default: str) -> str:
+    value = str(getattr(args, name, "") or "").strip()
+    return value if value else default
+
+
 def _get_float_option(args, name: str, default: float) -> float:
     value = getattr(args, name, default)
     if value is None:
@@ -207,15 +212,12 @@ def _build_teacher_input_ids_and_start_len(args, sample: Sample) -> tuple[list[i
     if privileged_context is None:
         return prompt_ids + response_ids, len(prompt_ids)
 
+    open_tag = _get_privileged_tag(args, "opd_privileged_open_tag", "[PRIVILEGED_CONTEXT]")
+    close_tag = _get_privileged_tag(args, "opd_privileged_close_tag", "[/PRIVILEGED_CONTEXT]")
+    suffix = f"\n{open_tag}\n{privileged_context}\n{close_tag}\n"
+
     tokenizer = _get_tokenizer(_get_tokenizer_path(args))
-    # Render as a proper system message so the teacher sees it in a format
-    # consistent with its chat training (e.g. <|im_start|>system\n...<|im_end|>).
-    privileged_text = tokenizer.apply_chat_template(
-        [{"role": "system", "content": privileged_context}],
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-    privileged_ids = [int(tid) for tid in tokenizer.encode(privileged_text, add_special_tokens=False)]
+    privileged_ids = [int(tid) for tid in tokenizer.encode(suffix, add_special_tokens=False)]
     scored_prompt_ids = prompt_ids + privileged_ids
     return scored_prompt_ids + response_ids, len(scored_prompt_ids)
 
