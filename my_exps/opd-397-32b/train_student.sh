@@ -16,6 +16,13 @@ export PYTHONBUFFERED=1
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 cd "${REPO_ROOT}"
+RAY_ADDR_UTIL="${SCRIPT_DIR}/ray_job_address_utils.sh"
+[[ -f "${RAY_ADDR_UTIL}" ]] || {
+  echo "Missing Ray address helper script: ${RAY_ADDR_UTIL}" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+source "${RAY_ADDR_UTIL}"
 
 MODEL_HOME="${MODEL_HOME:-$HOME/ckpt/hf_models/Qwen}"
 DATA_HOME="${DATA_HOME:-$HOME/ckpt}"
@@ -181,7 +188,7 @@ echo "Rollout length limits: context=${ROLLOUT_MAX_CONTEXT_LEN}, prompt<=${ROLLO
 TEACHER_HOST="${TEACHER_HOST:-worker-29}"
 TEACHER_PORT="${TEACHER_PORT:-13141}"
 TEACHER_URL="${TEACHER_URL:-http://${TEACHER_HOST}:${TEACHER_PORT}/generate}"
-RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://127.0.0.1:${RAY_DASHBOARD_PORT:-8265}}"
+RAY_JOB_ADDRESS="$(require_ray_job_address)"
 CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
 CURL_MAX_TIME="${CURL_MAX_TIME:-15}"
 
@@ -195,6 +202,7 @@ echo "Preflight: checking teacher endpoints at ${TEACHER_BASE} ..."
 curl -sf --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${TEACHER_BASE}/health_generate" >/dev/null
 curl -sf --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${TEACHER_BASE}/get_model_info" >/dev/null
 echo "Preflight: teacher endpoints OK"
+echo "Using Ray Job server: ${RAY_JOB_ADDRESS}"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [[ "${NVLINK_COUNT}" -gt 0 ]]; then

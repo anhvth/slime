@@ -90,6 +90,41 @@ DISTILL_LOSS_MODE=jsd OPD_TOP_LOGPROBS_NUM=16 OPD_JSD_BETA=0.5 \
 bash my_exps/opd-397-32b/train_student_async_jsd_with_privileged_infomation.sh
 ```
 
+## Resume from iter checkpoint with privileged 50k dataset
+
+Use this flow to continue training from `outputs/opd-397-32b/student_async/iter_0001599`
+with privileged context enabled by default.
+
+1. Convert checkpoint `iter_0001599` to HF and prepare `_torch_dist`:
+
+```bash
+bash my_exps/opd-397-32b/prepare_student_async_iter_resume.sh
+```
+
+2. Launch privileged JSD async training:
+
+```bash
+bash my_exps/opd-397-32b/train_student_async_jsd_with_privileged_infomation.sh
+```
+
+Wrapper defaults in this resume flow:
+
+- `PROMPT_DATA=$REPO_ROOT/datasets/50k_prompt_for_distillation_privileged.jsonl`
+- `RESUME_ITER_TAG=iter_0001599`
+- `RESUME_HF_DIR=$REPO_ROOT/outputs/opd-397-32b/student_async_hf/iter_0001599`
+- `RESUME_DIST_DIR=$REPO_ROOT/outputs/opd-397-32b/student_async_hf/iter_0001599_torch_dist`
+- `STUDENT_HF_CHECKPOINT=$RESUME_HF_DIR`
+- `STUDENT_REF_LOAD=$RESUME_DIST_DIR`
+- `STUDENT_LOAD=$RESUME_DIST_DIR`
+- `STUDENT_SAVE=$REPO_ROOT/outputs/opd-397-32b/student_async_distill_privileged_from_iter_0001599`
+
+Preflight checks in wrapper now fail fast if any required path is missing:
+
+- prompt dataset (`PROMPT_DATA`)
+- HF checkpoint directory (`STUDENT_HF_CHECKPOINT`)
+- ref checkpoint (`STUDENT_REF_LOAD`)
+- load checkpoint (`STUDENT_LOAD`)
+
 Backward-compatible alias:
 `my_exps/opd-397-32b/train_student_async_forward_kl.sh` now forwards to `train_student_async_distill.sh`.
 

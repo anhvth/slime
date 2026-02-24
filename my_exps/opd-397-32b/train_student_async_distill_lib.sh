@@ -1,5 +1,14 @@
 #!/bin/bash
 
+DISTILL_LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+RAY_ADDR_UTIL="${DISTILL_LIB_DIR}/ray_job_address_utils.sh"
+[[ -f "${RAY_ADDR_UTIL}" ]] || {
+  echo "Missing Ray address helper script: ${RAY_ADDR_UTIL}" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+source "${RAY_ADDR_UTIL}"
+
 require_file() {
   local path="$1"
   local message="$2"
@@ -78,28 +87,6 @@ yaml_escape() {
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
   printf '%s' "${value}"
-}
-
-resolve_ray_job_address() {
-  if [[ -n "${RAY_JOB_ADDRESS:-}" ]]; then
-    echo "${RAY_JOB_ADDRESS}"
-    return 0
-  fi
-
-  local job_list_output=""
-  job_list_output="$(ray job list 2>&1 | sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g')" || {
-    echo "Failed to run 'ray job list' to detect RAY_JOB_ADDRESS." >&2
-    exit 1
-  }
-
-  local detected_addr=""
-  detected_addr="$(printf '%s\n' "${job_list_output}" | grep -Eo 'https?://[^[:space:]]+' | head -n1 || true)"
-  if [[ -z "${detected_addr}" ]]; then
-    echo "Could not detect RAY_JOB_ADDRESS from 'ray job list' output." >&2
-    echo "Set RAY_JOB_ADDRESS explicitly, e.g. RAY_JOB_ADDRESS=http://<head-ip>:8265" >&2
-    exit 1
-  fi
-  echo "${detected_addr}"
 }
 
 gcd() {

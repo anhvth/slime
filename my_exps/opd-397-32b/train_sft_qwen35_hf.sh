@@ -14,6 +14,13 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 cd "${REPO_ROOT}"
+RAY_ADDR_UTIL="${SCRIPT_DIR}/ray_job_address_utils.sh"
+[[ -f "${RAY_ADDR_UTIL}" ]] || {
+  echo "Missing Ray address helper script: ${RAY_ADDR_UTIL}" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+source "${RAY_ADDR_UTIL}"
 
 export PYTHONBUFFERED=1
 
@@ -49,7 +56,7 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 ADAM_BETA1="${ADAM_BETA1:-0.9}"
 ADAM_BETA2="${ADAM_BETA2:-0.95}"
 
-RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://127.0.0.1:${RAY_DASHBOARD_PORT:-8265}}"
+RAY_JOB_ADDRESS="$(require_ray_job_address)"
 
 [[ -e "${STUDENT_HF_CHECKPOINT}" ]] || { echo "Missing HF checkpoint: ${STUDENT_HF_CHECKPOINT}" >&2; exit 1; }
 [[ -e "${PROMPT_DATA}" ]] || { echo "Missing prompt data path: ${PROMPT_DATA}" >&2; exit 1; }

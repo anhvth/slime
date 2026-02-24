@@ -1,13 +1,23 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /home/anhvth8/projects/slime
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
+cd "${REPO_ROOT}"
 export PYTHONBUFFERED=1
 
-source /home/anhvth8/projects/slime/scripts/models/qwen3-4B-as-qwen35.sh
+RAY_ADDR_UTIL="${SCRIPT_DIR}/ray_job_address_utils.sh"
+[[ -f "${RAY_ADDR_UTIL}" ]] || {
+  echo "Missing Ray address helper script: ${RAY_ADDR_UTIL}" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+source "${RAY_ADDR_UTIL}"
+
+source "${REPO_ROOT}/scripts/models/qwen3-4B-as-qwen35.sh"
 
 TEACHER_URL="${TEACHER_URL:-http://worker-15:13141/generate}"
-RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://127.0.0.1:8265}"
+RAY_JOB_ADDRESS="$(require_ray_job_address)"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [[ "${NVLINK_COUNT}" -gt 0 ]]; then
@@ -26,7 +36,7 @@ RUNTIME_ENV_JSON="{
 
 ray job submit --address="${RAY_JOB_ADDRESS}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- python3 /home/anhvth8/projects/slime/train.py \
+  -- python3 "${REPO_ROOT}/train.py" \
   --actor-num-nodes "${ACTOR_NUM_NODES:-3}" \
   --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE:-8}" \
   --colocate \
@@ -36,7 +46,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   --load /home/anhvth8/ckpt/hf_models/Qwen/Qwen3-4B-As-Qwen35_slime \
   --save /home/anhvth8/ckpt/hf_models/Qwen/Qwen3-4B-As-Qwen35_slime \
   --save-interval 20 \
-  --prompt-data /home/anhvth8/projects/slime/datasets/dapo-math-17k.jsonl \
+  --prompt-data "${REPO_ROOT}/datasets/dapo-math-17k.jsonl" \
   --input-key prompt \
   --apply-chat-template \
   --rollout-shuffle \

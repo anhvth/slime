@@ -1,0 +1,7 @@
+# Keep runtime_env package small for Ray Job submit.
+teacher-qwen-35/.venv/
+teacher-qwen-35/.cache/
+logs/
+__pycache__/
+**/__pycache__/
+*.pyc

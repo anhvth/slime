@@ -54,6 +54,8 @@ else
   STUDENT_LOAD_PATH=""
 fi
 mkdir -p "${OUTPUT_ROOT}"
+PROMPT_DATA_PATH="${PROMPT_DATA:-${REPO_ROOT}/datasets/200k_prompt_for_distillation.jsonl}"
+require_file "${PROMPT_DATA_PATH}" "Missing prompt dataset"
 
 ENSURE_REF_MODEL_SCRIPT="${SCRIPT_DIR}/ensure_ref_model.sh"
 require_file "${ENSURE_REF_MODEL_SCRIPT}" "Missing ref model helper script"
@@ -82,12 +84,7 @@ curl -sf "${TEACHER_BASE}/get_model_info" >/dev/null
 
 setup_distill_mode
 
-RAY_JOB_ADDRESS="$(resolve_ray_job_address)"
-if ! ray job list --address="${RAY_JOB_ADDRESS}" >/dev/null 2>&1; then
-  echo "Unable to reach Ray Job server at ${RAY_JOB_ADDRESS}." >&2
-  echo "Set RAY_JOB_ADDRESS explicitly, e.g. RAY_JOB_ADDRESS=http://<head-ip>:8265" >&2
-  exit 1
-fi
+RAY_JOB_ADDRESS="$(require_ray_job_address)"
 echo "Using Ray Job server: ${RAY_JOB_ADDRESS}"
 
 # Opinionated async layout for a 120-GPU cluster (15x8): 56 train (7 nodes) + 64 rollout (8 nodes).
@@ -223,7 +220,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   "${LOAD_ARGS[@]}" \
   --save "${STUDENT_SAVE_PATH}" \
   --save-interval "${SAVE_INTERVAL:-100}" \
-  --prompt-data "${PROMPT_DATA:-${REPO_ROOT}/datasets/200k_prompt_for_distillation.jsonl}" \
+  --prompt-data "${PROMPT_DATA_PATH}" \
   "${DATASET_KEY_ARGS[@]}" \
   --apply-chat-template \
   --rollout-shuffle \

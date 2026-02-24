@@ -14,6 +14,13 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 cd "${REPO_ROOT}"
+RAY_ADDR_UTIL="${SCRIPT_DIR}/ray_job_address_utils.sh"
+[[ -f "${RAY_ADDR_UTIL}" ]] || {
+  echo "Missing Ray address helper script: ${RAY_ADDR_UTIL}" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+source "${RAY_ADDR_UTIL}"
 
 mkdir -p "${SCRIPT_DIR}/logs"
 LOG_FILE="${SCRIPT_DIR}/logs/training_async_active.log"
@@ -90,33 +97,7 @@ TEACHER_BASE="${TEACHER_URL%/generate}"
 curl -sf "${TEACHER_BASE}/health_generate" >/dev/null
 curl -sf "${TEACHER_BASE}/get_model_info" >/dev/null
 
-resolve_ray_job_address() {
-  if [[ -n "${RAY_JOB_ADDRESS:-}" ]]; then
-    echo "${RAY_JOB_ADDRESS}"
-    return 0
-  fi
-
-  local job_list_output=""
-  job_list_output="$(ray job list 2>&1 | sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g')" || {
-    echo "Failed to run 'ray job list' to detect RAY_JOB_ADDRESS." >&2
-    exit 1
-  }
-  local detected_addr=""
-  detected_addr="$(printf '%s\n' "${job_list_output}" | grep -Eo 'https?://[^[:space:]]+' | head -n1 || true)"
-  if [[ -z "${detected_addr}" ]]; then
-    echo "Could not detect RAY_JOB_ADDRESS from 'ray job list' output." >&2
-    echo "Set RAY_JOB_ADDRESS explicitly, e.g. RAY_JOB_ADDRESS=http://<head-ip>:8265" >&2
-    exit 1
-  fi
-  echo "${detected_addr}"
-}
-
-RAY_JOB_ADDRESS="$(resolve_ray_job_address)"
-if ! ray job list --address="${RAY_JOB_ADDRESS}" >/dev/null 2>&1; then
-  echo "Unable to reach Ray Job server at ${RAY_JOB_ADDRESS}." >&2
-  echo "Set RAY_JOB_ADDRESS explicitly, e.g. RAY_JOB_ADDRESS=http://<head-ip>:8265" >&2
-  exit 1
-fi
+RAY_JOB_ADDRESS="$(require_ray_job_address)"
 echo "Using Ray Job server: ${RAY_JOB_ADDRESS}"
 
 # Opinionated async layout for a 120-GPU cluster (15x8): 56 train (7 nodes) + 64 rollout (8 nodes).
