@@ -27,6 +27,8 @@ class Sample:
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    teacher_topk_logprobs: list[list[float]] | None = None  # Teacher top-k logprobs for top-k distillation
+    teacher_topk_token_ids: list[list[int]] | None = None  # Teacher top-k token ids for top-k distillation
 
     class Status(Enum):
         PENDING = "pending"

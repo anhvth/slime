@@ -419,6 +419,8 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                "teacher_topk_logprobs",
+                "teacher_topk_token_ids",
             ]:
                 continue
             # Upload per sample mean for each rollout value
