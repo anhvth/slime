@@ -1,6 +1,6 @@
 # Top-k Distillation Extension (SGLang External Teacher)
 
-This experiment folder now supports four distillation modes via `train_student_async_forward_kl.sh` (original `train_student_async.sh` remains unchanged):
+This experiment folder now supports four distillation modes via `train_student_async_distill.sh` (original `train_student_async.sh` remains unchanged):
 
 - `rkl` (default): existing on-policy distillation path (reverse-KL-style advantage shaping).
 - `fkl`: forward KL on teacher top-k support.
@@ -20,7 +20,8 @@ This experiment folder now supports four distillation modes via `train_student_a
   - `my_exps/opd-397-32b/opd_topk_parser.py`
   - `my_exps/opd-397-32b/tests/test_topk_parser.py`
 - Wired mode switch in:
-  - `my_exps/opd-397-32b/train_student_async_forward_kl.sh`
+  - `my_exps/opd-397-32b/train_student_async_distill.sh`
+  - `my_exps/opd-397-32b/train_student_async_distill_lib.sh`
 
 ## Comparison with existing default OPD
 
@@ -48,7 +49,7 @@ Let `S` be top-k support, `p_t(i)=exp(log p_t(i))`, `p_s(i)=exp(log p_s(i))`:
 
 ## Mode switch interface
 
-Set these env vars when running `my_exps/opd-397-32b/train_student_async_forward_kl.sh`:
+Set these env vars when running `my_exps/opd-397-32b/train_student_async_distill.sh`:
 
 - `DISTILL_LOSS_MODE=rkl|fkl|mixed|jsd` (default: `rkl`)
 - `OPD_TOP_LOGPROBS_NUM` (default: `16`)
@@ -60,20 +61,23 @@ Examples:
 
 ```bash
 # Default existing behavior (unchanged)
-DISTILL_LOSS_MODE=rkl bash my_exps/opd-397-32b/train_student_async_forward_kl.sh
+DISTILL_LOSS_MODE=rkl bash my_exps/opd-397-32b/train_student_async_distill.sh
 
 # Forward KL with teacher top-16
 DISTILL_LOSS_MODE=fkl OPD_TOP_LOGPROBS_NUM=16 OPD_DISTILL_COEF=1.0 \
-  bash my_exps/opd-397-32b/train_student_async_forward_kl.sh
+  bash my_exps/opd-397-32b/train_student_async_distill.sh
 
 # Mixed KL
 DISTILL_LOSS_MODE=mixed OPD_TOP_LOGPROBS_NUM=16 OPD_MIXED_KL_WEIGHT=0.5 \
-  OPD_DISTILL_COEF=1.0 bash my_exps/opd-397-32b/train_student_async_forward_kl.sh
+  OPD_DISTILL_COEF=1.0 bash my_exps/opd-397-32b/train_student_async_distill.sh
 
 # Top-k renormalized JSD
 DISTILL_LOSS_MODE=jsd OPD_TOP_LOGPROBS_NUM=16 OPD_JSD_BETA=0.5 \
-  OPD_DISTILL_COEF=1.0 bash my_exps/opd-397-32b/train_student_async_forward_kl.sh
+  OPD_DISTILL_COEF=1.0 bash my_exps/opd-397-32b/train_student_async_distill.sh
 ```
+
+Backward-compatible alias:
+`my_exps/opd-397-32b/train_student_async_forward_kl.sh` now forwards to `train_student_async_distill.sh`.
 
 ## Current limitations (v1)
 
