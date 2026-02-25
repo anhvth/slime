@@ -124,6 +124,10 @@ export PYTHONBUFFERED=1
 if [[ ${DEBUG} -eq 1 ]]; then
   MODEL_CONFIG_REL="scripts/models/qwen3-4B-as-qwen35.sh"
   STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT:-/home/anhvth8/ckpt/hf_models/Qwen/Qwen3-4B-As-Qwen35}"
+  # Force debug-model paths; override any wrapper-supplied 32B paths
+  STUDENT_HF_CHECKPOINT="${STUDENT_HF_DEFAULT}"
+  unset STUDENT_REF_LOAD
+  unset STUDENT_LOAD
 else
   MODEL_CONFIG_REL="scripts/models/qwen3-32B-as-qwen35.sh"
   STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT:-$HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned/}"

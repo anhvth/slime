@@ -502,6 +502,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=0,
                 help="Initial grace period (in seconds) before starting health checks. This allows time for model compilation and initialization. Increase this value significantly when using deepgemm.",
             )
+            parser.add_argument(
+                "--async-rollout-cancel-retry-times",
+                type=int,
+                default=3,
+                help=(
+                    "Maximum number of retries when async rollout `ray.get` fails with CancelledError. "
+                    "Total attempts = retry_times + 1."
+                ),
+            )
+            parser.add_argument(
+                "--async-rollout-cancel-retry-backoff-base-seconds",
+                type=float,
+                default=1.0,
+                help=(
+                    "Base backoff in seconds for async rollout cancellation retries. "
+                    "Backoff schedule is base * 2^attempt_idx."
+                ),
+            )
+            parser.add_argument(
+                "--async-rollout-cancel-recover-engines",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Whether to call rollout_manager.recover_rollout_engines() before each cancellation retry.",
+            )
             return parser
 
         # data
@@ -1598,6 +1622,10 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+    assert args.async_rollout_cancel_retry_times >= 0, "async_rollout_cancel_retry_times must be >= 0."
+    assert (
+        args.async_rollout_cancel_retry_backoff_base_seconds > 0
+    ), "async_rollout_cancel_retry_backoff_base_seconds must be > 0."
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):

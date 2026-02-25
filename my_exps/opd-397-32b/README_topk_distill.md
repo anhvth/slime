@@ -139,7 +139,7 @@ Preflight checks in wrapper now fail fast if any required path is missing:
 - load checkpoint (`STUDENT_LOAD`)
 
 Backward-compatible alias:
-`my_exps/opd-397-32b/train_student_async_forward_kl.sh` now forwards to `train_student_async_distill.sh`.
+`my_exps/opd-397-32b/train_student_async_custom_loss.sh` now forwards to `train_student_async_distill.sh`.
 
 ## Dataset contract for privileged context
 

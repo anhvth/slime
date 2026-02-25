@@ -133,7 +133,19 @@ class RolloutManager:
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        try:
+            data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        except Exception:
+            alive_engines = sum(1 for engine in self.rollout_engines if engine is not None)
+            total_engines = len(self.rollout_engines)
+            logger.exception(
+                "Rollout generation failed: rollout_id=%s use_fault_tolerance=%s alive_rollout_engines=%s/%s",
+                rollout_id,
+                self.args.use_fault_tolerance,
+                alive_engines,
+                total_engines,
+            )
+            raise
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = self._convert_samples_to_train_data(data)
