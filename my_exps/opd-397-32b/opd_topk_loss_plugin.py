@@ -149,7 +149,7 @@ def compute_cross_tokenizer_group_losses(
     mixed_weight: float,
     jsd_beta: float,
 ) -> dict[str, torch.Tensor | int]:
-    """Compute per-group distillation terms for cross-tokenizer mode.
+    """Compute per-group distillation terms for cross-tokenizer mode (vectorized).
 
     Args:
         teacher_log_probs: [R, K] merged teacher log-probs.
@@ -177,71 +177,86 @@ def compute_cross_tokenizer_group_losses(
     if group_valid_mask.ndim != 1 or group_valid_mask.size(0) != response_len:
         raise ValueError(f"group_valid_mask must be [R], got shape={tuple(group_valid_mask.shape)}")
 
-    forward_terms: list[torch.Tensor] = []
-    reverse_terms: list[torch.Tensor] = []
-    jsd_terms: list[torch.Tensor] | None = [] if mode == "jsd" else None
-
-    valid_groups = 0
-    skipped_groups = 0
-    mapped_support = 0
-    total_support = 0
-    forward_debug = torch.zeros((response_len,), device=teacher_log_probs.device, dtype=teacher_log_probs.dtype)
-    reverse_debug = torch.zeros((response_len,), device=teacher_log_probs.device, dtype=teacher_log_probs.dtype)
-    jsd_debug = (
-        torch.zeros((response_len,), device=teacher_log_probs.device, dtype=teacher_log_probs.dtype)
-        if mode == "jsd"
-        else None
-    )
-
-    for anchor in range(response_len):
-        group_len = int(group_lengths[anchor].item())
-        if group_len <= 0:
-            continue
-
-        total_support += topk
-        if int(group_valid_mask[anchor].item()) == 0:
-            skipped_groups += 1
-            continue
-
-        end = anchor + group_len
-        if end > response_len:
-            skipped_groups += 1
-            continue
-
-        continuation_logprob = student_actual_log_probs[anchor + 1 : end].sum() if group_len > 1 else 0.0
-
-        teacher_row_lp = teacher_log_probs[anchor].unsqueeze(0)
-        student_row_lp = (student_anchor_log_probs[anchor] + continuation_logprob).unsqueeze(0)
-
-        forward_kl, reverse_kl = _compute_forward_reverse_terms_unbalanced(teacher_row_lp, student_row_lp)
-        forward_terms.append(forward_kl.squeeze(0))
-        reverse_terms.append(reverse_kl.squeeze(0))
-        forward_debug[anchor] = forward_kl.squeeze(0)
-        reverse_debug[anchor] = reverse_kl.squeeze(0)
-
-        if jsd_terms is not None:
-            jsd = compute_topk_renormalized_jsd(teacher_row_lp, student_row_lp, beta=jsd_beta)
-            jsd_terms.append(jsd.squeeze(0))
-            assert jsd_debug is not None
-            jsd_debug[anchor] = jsd.squeeze(0)
-
-        mapped_support += int((teacher_row_lp.squeeze(0) > _TOPK_PAD_THRESHOLD).sum().item())
-        valid_groups += 1
-
     device = teacher_log_probs.device
     dtype = teacher_log_probs.dtype
 
-    if forward_terms:
-        forward_all = torch.stack(forward_terms)
-        reverse_all = torch.stack(reverse_terms)
-        if jsd_terms is not None:
-            jsd_all = torch.stack(jsd_terms)
-        else:
-            jsd_all = torch.empty((0,), device=device, dtype=dtype)
+    # Find all anchor positions (group_lengths > 0)
+    anchor_mask = group_lengths > 0
+    num_anchors = int(anchor_mask.sum().item())
+    total_support = num_anchors * topk
+
+    empty_result = {
+        "forward": torch.empty((0,), device=device, dtype=dtype),
+        "reverse": torch.empty((0,), device=device, dtype=dtype),
+        "jsd": torch.empty((0,), device=device, dtype=dtype),
+        "forward_debug": torch.zeros((response_len,), device=device, dtype=dtype),
+        "reverse_debug": torch.zeros((response_len,), device=device, dtype=dtype),
+        "jsd_debug": (
+            torch.zeros((response_len,), device=device, dtype=dtype)
+            if mode == "jsd"
+            else torch.empty((0,), device=device, dtype=dtype)
+        ),
+        "valid_groups": 0,
+        "skipped_groups": 0,
+        "mapped_support": 0,
+        "total_support": total_support,
+    }
+
+    if num_anchors == 0:
+        return empty_result
+
+    anchor_indices = anchor_mask.nonzero(as_tuple=True)[0]  # [num_anchors]
+    anchor_lens = group_lengths[anchor_indices]  # [num_anchors]
+    anchor_ends = anchor_indices + anchor_lens  # [num_anchors]
+    anchor_valid = group_valid_mask[anchor_indices] > 0
+    anchor_in_bounds = anchor_ends <= response_len
+    usable = anchor_valid & anchor_in_bounds
+
+    skipped_groups = num_anchors - int(usable.sum().item())
+
+    if not usable.any():
+        empty_result["skipped_groups"] = skipped_groups
+        empty_result["total_support"] = total_support
+        return empty_result
+
+    usable_idx = anchor_indices[usable]  # [N]
+    usable_lens = anchor_lens[usable]  # [N]
+    usable_ends = anchor_ends[usable]  # [N]
+
+    # Compute continuation logprobs via prefix sum (vectorized)
+    prefix_sum = torch.zeros(response_len + 1, device=device, dtype=dtype)
+    prefix_sum[1:] = torch.cumsum(student_actual_log_probs, dim=0)
+    continuation = prefix_sum[usable_ends] - prefix_sum[usable_idx + 1]
+    continuation = torch.where(usable_lens > 1, continuation, torch.zeros_like(continuation))
+
+    # Batch gather teacher and student logprobs for all usable anchors
+    teacher_lp = teacher_log_probs[usable_idx]  # [N, K]
+    student_lp = student_anchor_log_probs[usable_idx] + continuation.unsqueeze(-1)  # [N, K]
+
+    # Batch compute forward/reverse KL
+    forward_all, reverse_all = _compute_forward_reverse_terms_unbalanced(teacher_lp, student_lp)  # [N], [N]
+
+    # JSD if needed
+    if mode == "jsd":
+        jsd_all = compute_topk_renormalized_jsd(teacher_lp, student_lp, beta=jsd_beta)  # [N]
     else:
-        forward_all = torch.empty((0,), device=device, dtype=dtype)
-        reverse_all = torch.empty((0,), device=device, dtype=dtype)
         jsd_all = torch.empty((0,), device=device, dtype=dtype)
+
+    # Support coverage (vectorized)
+    mapped_support = int((teacher_lp > _TOPK_PAD_THRESHOLD).sum().item())
+    valid_groups = int(usable_idx.size(0))
+
+    # Debug per-position tensors
+    forward_debug = torch.zeros((response_len,), device=device, dtype=dtype)
+    reverse_debug = torch.zeros((response_len,), device=device, dtype=dtype)
+    forward_debug[usable_idx] = forward_all.detach()
+    reverse_debug[usable_idx] = reverse_all.detach()
+
+    if mode == "jsd":
+        jsd_debug = torch.zeros((response_len,), device=device, dtype=dtype)
+        jsd_debug[usable_idx] = jsd_all.detach()
+    else:
+        jsd_debug = torch.empty((0,), device=device, dtype=dtype)
 
     return {
         "forward": forward_all,
@@ -249,7 +264,7 @@ def compute_cross_tokenizer_group_losses(
         "jsd": jsd_all,
         "forward_debug": forward_debug,
         "reverse_debug": reverse_debug,
-        "jsd_debug": jsd_debug if jsd_debug is not None else torch.empty((0,), device=device, dtype=dtype),
+        "jsd_debug": jsd_debug,
         "valid_groups": valid_groups,
         "skipped_groups": skipped_groups,
         "mapped_support": mapped_support,

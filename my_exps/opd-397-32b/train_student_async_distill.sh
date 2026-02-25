@@ -238,11 +238,45 @@ require_positive_int "${TEACHER_HEALTH_RETRY_SEC}" "TEACHER_HEALTH_RETRY_SEC"
 wait_http_healthy "${TEACHER_BASE}/health_generate" "health_generate" "${TEACHER_HEALTH_MAX_ATTEMPTS}" "${TEACHER_HEALTH_RETRY_SEC}"
 wait_http_healthy "${TEACHER_BASE}/get_model_info" "get_model_info" "${TEACHER_HEALTH_MAX_ATTEMPTS}" "${TEACHER_HEALTH_RETRY_SEC}"
 
-# Opinionated async layout for a 120-GPU cluster (15x8): 56 train (7 nodes) + 64 rollout (8 nodes).
-ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-7}"
+# Cluster-aware async layout.
+# Default split: 11x8 GPUs => 4 train nodes (32 GPUs) + 56 rollout GPUs (7 engines).
+TOTAL_CLUSTER_NODES="${TOTAL_CLUSTER_NODES:-11}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
-ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-64}"
+ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-4}"
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-8}"
+
+require_positive_int "${TOTAL_CLUSTER_NODES}" "TOTAL_CLUSTER_NODES"
+require_positive_int "${ACTOR_NUM_NODES}" "ACTOR_NUM_NODES"
+require_positive_int "${ACTOR_NUM_GPUS_PER_NODE}" "ACTOR_NUM_GPUS_PER_NODE"
+require_positive_int "${ROLLOUT_NUM_GPUS_PER_ENGINE}" "ROLLOUT_NUM_GPUS_PER_ENGINE"
+
+TOTAL_CLUSTER_GPUS=$((TOTAL_CLUSTER_NODES * ACTOR_NUM_GPUS_PER_NODE))
+TRAIN_NUM_GPUS=$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))
+
+(( TRAIN_NUM_GPUS < TOTAL_CLUSTER_GPUS )) || {
+  echo "Invalid resource split: train GPUs (${TRAIN_NUM_GPUS}) must be smaller than total cluster GPUs (${TOTAL_CLUSTER_GPUS})." >&2
+  echo "Set ACTOR_NUM_NODES lower or TOTAL_CLUSTER_NODES higher." >&2
+  exit 1
+}
+
+if [[ -z "${ROLLOUT_NUM_GPUS:-}" ]]; then
+  ROLLOUT_NUM_GPUS=$((TOTAL_CLUSTER_GPUS - TRAIN_NUM_GPUS))
+fi
+require_positive_int "${ROLLOUT_NUM_GPUS}" "ROLLOUT_NUM_GPUS"
+
+TOTAL_REQUESTED_GPUS=$((TRAIN_NUM_GPUS + ROLLOUT_NUM_GPUS))
+(( TOTAL_REQUESTED_GPUS <= TOTAL_CLUSTER_GPUS )) || {
+  echo "Invalid resource split: requested ${TOTAL_REQUESTED_GPUS} GPUs (train=${TRAIN_NUM_GPUS}, rollout=${ROLLOUT_NUM_GPUS})" >&2
+  echo "but total available from TOTAL_CLUSTER_NODES(${TOTAL_CLUSTER_NODES}) x ACTOR_NUM_GPUS_PER_NODE(${ACTOR_NUM_GPUS_PER_NODE}) = ${TOTAL_CLUSTER_GPUS}." >&2
+  echo "Reduce ACTOR_NUM_NODES/ROLLOUT_NUM_GPUS or increase TOTAL_CLUSTER_NODES." >&2
+  exit 1
+}
+
+(( ROLLOUT_NUM_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE == 0 )) || {
+  echo "ROLLOUT_NUM_GPUS (${ROLLOUT_NUM_GPUS}) must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE (${ROLLOUT_NUM_GPUS_PER_ENGINE})." >&2
+  exit 1
+}
+ROLLOUT_ENGINE_COUNT=$((ROLLOUT_NUM_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))
 
 TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-8}"
 WORLD_SIZE=$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))
@@ -254,7 +288,8 @@ DP_SIZE=$((WORLD_SIZE / TENSOR_MODEL_PARALLEL_SIZE))
 
 BASE_PROMPTS_PER_DP="${BASE_PROMPTS_PER_DP:-8}"
 if [[ -z "${ROLLOUT_BATCH_SIZE:-}" ]]; then
-  ROLLOUT_BATCH_SIZE=$((BASE_PROMPTS_PER_DP * DP_SIZE))
+  # Keep rollout-side occupancy high even when training DP is reduced.
+  ROLLOUT_BATCH_SIZE="${DEFAULT_ROLLOUT_BATCH_SIZE:-56}"
 fi
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
 if [[ -z "${GLOBAL_BATCH_SIZE:-}" ]]; then
@@ -283,6 +318,9 @@ fi
   exit 1
 }
 NUM_ROLLOUT_DEFAULT=$(((TARGET_PROMPTS + ROLLOUT_BATCH_SIZE - 1) / ROLLOUT_BATCH_SIZE))
+
+echo "Resource layout: total_nodes=${TOTAL_CLUSTER_NODES}, total_gpus=${TOTAL_CLUSTER_GPUS}, train_nodes=${ACTOR_NUM_NODES}, train_gpus=${TRAIN_NUM_GPUS}, rollout_gpus=${ROLLOUT_NUM_GPUS}, rollout_engines=${ROLLOUT_ENGINE_COUNT}x${ROLLOUT_NUM_GPUS_PER_ENGINE}"
+echo "Batch layout: tp=${TENSOR_MODEL_PARALLEL_SIZE}, dp=${DP_SIZE}, rollout_batch_size=${ROLLOUT_BATCH_SIZE}, n_samples_per_prompt=${N_SAMPLES_PER_PROMPT}, global_batch_size=${GLOBAL_BATCH_SIZE}"
 
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-2048}"
 if [[ -z "${ROLLOUT_MAX_CONTEXT_LEN:-}" ]]; then
@@ -319,6 +357,43 @@ RUNTIME_ENV_JSON="{
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
 }"
+
+USE_WANDB="$(normalize_bool_flag "${USE_WANDB:-0}" "USE_WANDB")"
+USE_TENSORBOARD="$(normalize_bool_flag "${USE_TENSORBOARD:-1}" "USE_TENSORBOARD")"
+DEFAULT_LOG_GROUP="${WANDB_GROUP:-opd-397-32b-student-async-distill}"
+LOGGING_ARGS=()
+
+if [[ "${USE_WANDB}" == "1" ]]; then
+  WANDB_MODE_ARGS=()
+  if [[ -n "${WANDB_MODE:-}" ]]; then
+    WANDB_MODE_NORMALIZED="$(echo "${WANDB_MODE}" | tr '[:upper:]' '[:lower:]')"
+    case "${WANDB_MODE_NORMALIZED}" in
+      online|offline|disabled)
+        WANDB_MODE_ARGS=(--wandb-mode "${WANDB_MODE_NORMALIZED}")
+        echo "W&B mode override from environment: ${WANDB_MODE_NORMALIZED}"
+        ;;
+      *)
+        echo "Ignoring invalid WANDB_MODE='${WANDB_MODE}'. Expected online|offline|disabled." >&2
+        ;;
+    esac
+  fi
+  LOGGING_ARGS+=(--use-wandb)
+  LOGGING_ARGS+=("${WANDB_MODE_ARGS[@]}")
+  LOGGING_ARGS+=(--wandb-project "${WANDB_PROJECT:-slime-opd}")
+  LOGGING_ARGS+=(--wandb-group "${DEFAULT_LOG_GROUP}")
+else
+  if [[ -n "${WANDB_MODE:-}" ]]; then
+    echo "Ignoring WANDB_MODE='${WANDB_MODE}' because USE_WANDB=0." >&2
+  fi
+fi
+
+if [[ "${USE_TENSORBOARD}" == "1" ]]; then
+  LOGGING_ARGS+=(--use-tensorboard)
+  LOGGING_ARGS+=(--tb-project-name "${TB_PROJECT_NAME:-slime-opd}")
+  LOGGING_ARGS+=(--tb-experiment-name "${TB_EXPERIMENT_NAME:-${DEFAULT_LOG_GROUP}}")
+fi
+
+echo "Logging backends: wandb=${USE_WANDB}, tensorboard=${USE_TENSORBOARD}"
 
 CKPT_PRUNER_PID=""
 if (( MAX_CHECKPOINTS_TO_KEEP > 0 )); then
@@ -385,7 +460,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}" \
   --rollout-top-p "${ROLLOUT_TOP_P}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE}" \
-  --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-1}" \
+  --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-5}" \
   --balance-data \
   --optimizer adam \
   --lr "${LR}" \
@@ -416,10 +491,8 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   --use-dynamic-batch-size \
   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}" \
   --sglang-mem-fraction-static "${ROLLOUT_SGLANG_MEM_FRACTION_STATIC:-0.7}" \
-  --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 "${SGLANG_CUDA_GRAPH_BS_MAX:-256}") \
-  --use-wandb \
-  --wandb-project "${WANDB_PROJECT:-slime-opd}" \
-  --wandb-group "${WANDB_GROUP:-opd-397-32b-student-async-distill}" \
+  --sglang-cuda-graph-bs ${SGLANG_CUDA_GRAPH_BS:-1 2 4 8 16 32 64 128 256} \
+  "${LOGGING_ARGS[@]}" \
   --attention-dropout 0.0 \
   --hidden-dropout 0.0 \
   --accumulate-allreduce-grads-in-fp32 \

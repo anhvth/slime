@@ -150,14 +150,31 @@ class RolloutManager:
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         self._latest_custom_reward_post_process_metrics = {}
+        logger.info(
+            "[DEBUG][rollout %s] Begin reward/sample post-process for %s samples",
+            rollout_id,
+            len(data),
+        )
         reward_postprocess_start_time = time.perf_counter()
         data = self._convert_samples_to_train_data(data)
         reward_postprocess_total_time_s = time.perf_counter() - reward_postprocess_start_time
+        logger.info(
+            "[DEBUG][rollout %s] Finished reward/sample post-process in %.2fs",
+            rollout_id,
+            reward_postprocess_total_time_s,
+        )
         post_process_log_dict = {"perf/reward_postprocess_total_time_s": reward_postprocess_total_time_s}
         post_process_log_dict.update(self._latest_custom_reward_post_process_metrics)
         post_process_log_dict["rollout/step"] = compute_rollout_step(self.args, rollout_id)
         logging_utils.log(self.args, post_process_log_dict, step_key="rollout/step")
-        return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+        split_start_time = time.perf_counter()
+        rollout_data_refs = self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+        logger.info(
+            "[DEBUG][rollout %s] Finished DP split + ray.put in %.2fs",
+            rollout_id,
+            time.perf_counter() - split_start_time,
+        )
+        return rollout_data_refs
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -322,8 +339,15 @@ class RolloutManager:
             torch.save(dict(rollout_id=rollout_id, **dump_data), path)
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
+        sample_count = len(samples)
+        stage_start_time = time.perf_counter()
         self._latest_custom_reward_post_process_metrics = {}
         if self.custom_reward_post_process_func is not None:
+            logger.info(
+                "[DEBUG] Enter custom reward post-process: sample_count=%s, path=%s",
+                sample_count,
+                self.args.custom_reward_post_process_path,
+            )
             custom_output = self.custom_reward_post_process_func(self.args, samples)
             if not isinstance(custom_output, (tuple, list)):
                 raise ValueError(
@@ -332,6 +356,10 @@ class RolloutManager:
                 )
             if len(custom_output) == 2:
                 raw_rewards, rewards = custom_output
+                logger.info(
+                    "[DEBUG] Custom reward post-process finished in %.2fs",
+                    time.perf_counter() - stage_start_time,
+                )
                 return raw_rewards, rewards
             if len(custom_output) == 3:
                 raw_rewards, rewards, metrics = custom_output
@@ -343,12 +371,18 @@ class RolloutManager:
                         f"got {type(metrics)}."
                     )
                 self._latest_custom_reward_post_process_metrics = dict(metrics)
+                logger.info(
+                    "[DEBUG] Custom reward post-process finished in %.2fs (metrics=%s)",
+                    time.perf_counter() - stage_start_time,
+                    sorted(self._latest_custom_reward_post_process_metrics.keys()),
+                )
                 return raw_rewards, rewards
             raise ValueError(
                 "Custom reward post-process function must return either "
                 "(raw_rewards, rewards) or (raw_rewards, rewards, metrics_dict)."
             )
 
+        logger.info("[DEBUG] Enter default reward post-process: sample_count=%s", sample_count)
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
         if (
             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
@@ -368,15 +402,30 @@ class RolloutManager:
                 std = rewards.std(dim=-1, keepdim=True)
                 rewards = rewards / (std + 1e-6)
 
+            logger.info(
+                "[DEBUG] Default reward post-process finished in %.2fs (group-normalized)",
+                time.perf_counter() - stage_start_time,
+            )
             return raw_rewards, rewards.flatten().tolist()
 
+        logger.info(
+            "[DEBUG] Default reward post-process finished in %.2fs",
+            time.perf_counter() - stage_start_time,
+        )
         return raw_rewards, raw_rewards
 
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
         """
         Convert inference generated samples to training data.
         """
+        sample_count = len(samples)
+        stage_start_time = time.perf_counter()
+        logger.info("[DEBUG] Enter _convert_samples_to_train_data: sample_count=%s", sample_count)
         if self.custom_convert_samples_to_train_data_func is not None:
+            logger.info(
+                "[DEBUG] Using custom convert function: path=%s",
+                self.args.custom_convert_samples_to_train_data_path,
+            )
             return self.custom_convert_samples_to_train_data_func(self.args, samples)
 
         raw_rewards, rewards = self._post_process_rewards(samples)
@@ -398,7 +447,8 @@ class RolloutManager:
         # loss mask
         # TODO: compress the loss mask
         loss_masks = []
-        for sample in samples:
+        progress_interval = max(1, sample_count // 10)
+        for i, sample in enumerate(samples, start=1):
             # always instantiate loss_mask if not provided
             if sample.loss_mask is None:
                 sample.loss_mask = [1] * sample.response_length
@@ -409,6 +459,8 @@ class RolloutManager:
             if sample.remove_sample:
                 sample.loss_mask = [0] * sample.response_length
             loss_masks.append(sample.loss_mask)
+            if i % progress_interval == 0 or i == sample_count:
+                logger.info("[DEBUG] Building loss_masks: %s/%s", i, sample_count)
         train_data["loss_masks"] = loss_masks
 
         # overwriting the raw reward
@@ -447,6 +499,11 @@ class RolloutManager:
         if samples[0].teacher_topk_group_valid_mask is not None:
             train_data["teacher_topk_group_valid_mask"] = [sample.teacher_topk_group_valid_mask for sample in samples]
 
+        logger.info(
+            "[DEBUG] _convert_samples_to_train_data finished in %.2fs (keys=%s)",
+            time.perf_counter() - stage_start_time,
+            sorted(train_data.keys()),
+        )
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -455,12 +512,19 @@ class RolloutManager:
     def _split_train_data_by_dp(self, data, dp_size):
         """Split the train data by data parallel size."""
         rollout_data = {}
+        stage_start_time = time.perf_counter()
 
         if "prompt" in data:
             rollout_data["prompt"] = data["prompt"]
 
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
+        logger.info(
+            "[DEBUG] Enter _split_train_data_by_dp: sample_count=%s, dp_size=%s, balance_data=%s",
+            len(total_lengths),
+            dp_size,
+            self.args.balance_data,
+        )
 
         if self.args.balance_data:
             partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
@@ -473,6 +537,12 @@ class RolloutManager:
             rollout_data = {}
             partition = partitions[i]
             rollout_data["partition"] = partition
+            logger.info(
+                "[DEBUG] Split shard %s/%s: partition_size=%s",
+                i + 1,
+                dp_size,
+                len(partition),
+            )
             for key in [
                 "tokens",
                 "multimodal_train_inputs",
@@ -509,6 +579,10 @@ class RolloutManager:
             if hasattr(self, "_dynamic_global_batch_size"):
                 rollout_data["dynamic_global_batch_size"] = self._dynamic_global_batch_size
             rollout_data_refs.append(Box(ray.put(rollout_data)))
+        logger.info(
+            "[DEBUG] _split_train_data_by_dp finished in %.2fs",
+            time.perf_counter() - stage_start_time,
+        )
         return rollout_data_refs
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import time
 from functools import lru_cache
@@ -18,6 +19,7 @@ from opd_topk_parser import TOPK_PAD_LOGPROB, TOPK_PAD_TOKEN_ID, extract_topk_fr
 _HTTP_SESSION: aiohttp.ClientSession | None = None
 _HTTP_SESSION_LOOP: asyncio.AbstractEventLoop | None = None
 _HTTP_SESSION_URL: str | None = None
+logger = logging.getLogger(__name__)
 
 
 def _get_topk(args) -> int:
@@ -122,6 +124,37 @@ def _get_student_tokenizer_path(args) -> str:
 @lru_cache(maxsize=8)
 def _get_tokenizer(tokenizer_path: str):
     return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+
+
+@lru_cache(maxsize=4)
+def _build_teacher_to_student_token_map(
+    teacher_tokenizer_path: str,
+    student_tokenizer_path: str,
+) -> dict[int, int]:
+    """Pre-compute teacher_token_id -> student_token_id mapping (one-time cost).
+
+    Only includes entries where a teacher token decodes to text that encodes
+    to exactly one student token.  Cache miss at lookup time means "no valid
+    1-to-1 mapping" — same semantics as the old per-call fallback.
+    """
+    teacher_tokenizer = _get_tokenizer(teacher_tokenizer_path)
+    student_tokenizer = _get_tokenizer(student_tokenizer_path)
+
+    mapping: dict[int, int] = {}
+    vocab_size = len(teacher_tokenizer)  # includes added tokens
+
+    for tid in range(vocab_size):
+        try:
+            surface = teacher_tokenizer.decode(
+                [tid], skip_special_tokens=False, clean_up_tokenization_spaces=False,
+            )
+            student_ids = student_tokenizer.encode(surface, add_special_tokens=False)
+            if len(student_ids) == 1:
+                mapping[tid] = int(student_ids[0])
+        except Exception:
+            pass
+
+    return mapping
 
 
 def _get_privileged_tag(args, name: str, default: str) -> str:
@@ -334,8 +367,20 @@ def _build_teacher_input_ids_and_start_len(args, sample: Sample) -> tuple[list[i
     return _build_teacher_input_ids_and_start_len_same_tokenizer(args, sample)
 
 
+def _resolve_teacher_score_logprob_start_len(logical_start_len: int) -> int:
+    """Shift teacher scoring window by one token to recover first response-token supervision.
+
+    Some teacher endpoints return an unusable first scored row (e.g. input_top_logprobs[0] is None).
+    Requesting scores from one token earlier lets us recover supervision for logical response index 0
+    while still slicing the final response span using the logical boundary.
+    """
+    logical_start_len = int(logical_start_len)
+    return logical_start_len - 1 if logical_start_len > 0 else logical_start_len
+
+
 def _build_teacher_payload(args, sample: Sample, topk: int) -> dict:
-    input_ids, logprob_start_len = _build_teacher_input_ids_and_start_len(args, sample)
+    input_ids, logical_logprob_start_len = _build_teacher_input_ids_and_start_len(args, sample)
+    score_logprob_start_len = _resolve_teacher_score_logprob_start_len(logical_logprob_start_len)
     return {
         "input_ids": input_ids,
         "sampling_params": {
@@ -344,14 +389,21 @@ def _build_teacher_payload(args, sample: Sample, topk: int) -> dict:
             "skip_special_tokens": False,
         },
         "return_logprob": True,
-        "logprob_start_len": logprob_start_len,
+        # Request teacher scoring from one token earlier when possible.
+        "logprob_start_len": score_logprob_start_len,
         "top_logprobs_num": topk,
+        # Keep logical boundary for downstream response-span slicing/debugging.
+        "_opd_teacher_logprob_start_len": logical_logprob_start_len,
+        "_opd_teacher_score_logprob_start_len": score_logprob_start_len,
     }
 
 
 async def reward_func_topk(args, sample: Sample, **kwargs):
     topk = _get_topk(args)
     payload = _build_teacher_payload(args, sample, topk)
+    score_logprob_start_len = int(payload.get("_opd_teacher_score_logprob_start_len", payload.get("logprob_start_len", 0)))
+    logical_logprob_start_len = int(payload.get("_opd_teacher_logprob_start_len", score_logprob_start_len))
+    request_payload = {k: v for k, v in payload.items() if not str(k).startswith("_opd_")}
     attempts = _get_int_option(args, "opd_rm_retry_attempts", 5)
     base_sleep = _get_float_option(args, "opd_rm_retry_base_sleep_s", 0.15)
     max_sleep = _get_float_option(args, "opd_rm_retry_max_sleep_s", 2.0)
@@ -361,7 +413,7 @@ async def reward_func_topk(args, sample: Sample, **kwargs):
     for attempt in range(1, attempts + 1):
         try:
             session = await _get_http_session(args)
-            async with session.post(args.rm_url, json=payload) as resp:
+            async with session.post(args.rm_url, json=request_payload) as resp:
                 resp.raise_for_status()
                 result = await resp.json()
             latency = time.perf_counter() - start
@@ -370,8 +422,9 @@ async def reward_func_topk(args, sample: Sample, **kwargs):
                 if isinstance(meta_info, dict):
                     meta_info["client_http_latency"] = latency
                     meta_info["client_http_attempts"] = attempt
-                result["_opd_teacher_input_ids"] = payload["input_ids"]
-                result["_opd_teacher_logprob_start_len"] = payload["logprob_start_len"]
+                result["_opd_teacher_input_ids"] = request_payload["input_ids"]
+                result["_opd_teacher_logprob_start_len"] = logical_logprob_start_len
+                result["_opd_teacher_score_logprob_start_len"] = score_logprob_start_len
             return result
         except ClientError as exc:
             last_exc = exc
@@ -779,16 +832,34 @@ def _build_cross_tokenizer_teacher_targets(
 
 def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
     """Extract fixed-size teacher top-k tensors and attach to each sample."""
+    stage_start_time = time.perf_counter()
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     response_lengths = [sample.response_length for sample in samples]
     topk = _get_topk(args)
     cross_tokenizer = _is_cross_tokenizer_enabled(args)
+    sample_count = len(samples)
+    progress_interval = int(getattr(args, "opd_postprocess_progress_interval", 0) or 0)
+    if progress_interval <= 0:
+        progress_interval = max(1, sample_count // 10)
+    logger.info(
+        (
+            "[DEBUG][opd_topk] Begin reward post-process: sample_count=%s, topk=%s, "
+            "cross_tokenizer=%s, progress_interval=%s"
+        ),
+        sample_count,
+        topk,
+        int(cross_tokenizer),
+        progress_interval,
+    )
     alignment_total_times: list[float] = []
     alignment_build_groups_times: list[float] = []
     alignment_project_support_times: list[float] = []
     alignment_fallback_flags: list[float] = []
 
-    for sample, reward, response_length in zip(samples, raw_rewards, response_lengths, strict=False):
+    for i, (sample, reward, response_length) in enumerate(
+        zip(samples, raw_rewards, response_lengths, strict=False),
+        start=1,
+    ):
         if cross_tokenizer:
             if not isinstance(reward, dict):
                 raise ValueError(f"reward payload must be a dict in cross-tokenizer mode, got {type(reward)}.")
@@ -829,6 +900,22 @@ def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
             teacher_logprob_start_len = reward.get("_opd_teacher_logprob_start_len")
             if teacher_logprob_start_len is not None:
                 sample.teacher_logprob_start_len = int(teacher_logprob_start_len)
+            teacher_score_logprob_start_len = reward.get("_opd_teacher_score_logprob_start_len")
+            if teacher_score_logprob_start_len is not None:
+                # Optional diagnostic field; Sample may not have a declared attribute in older versions.
+                setattr(sample, "teacher_score_logprob_start_len", int(teacher_score_logprob_start_len))
+
+        if i % progress_interval == 0 or i == sample_count:
+            elapsed_s = time.perf_counter() - stage_start_time
+            avg_s = elapsed_s / i if i > 0 else 0.0
+            logger.info(
+                "[DEBUG][opd_topk] reward post-process progress: %s/%s (%.1f%%), elapsed=%.2fs, avg=%.4fs/sample",
+                i,
+                sample_count,
+                100.0 * i / max(sample_count, 1),
+                elapsed_s,
+                avg_s,
+            )
 
     metrics_dict: dict[str, float] = {}
     if cross_tokenizer:
@@ -855,4 +942,8 @@ def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
         }
 
     scalar_rewards = [0.0] * len(samples)
+    logger.info(
+        "[DEBUG][opd_topk] Finished reward post-process in %.2fs",
+        time.perf_counter() - stage_start_time,
+    )
     return scalar_rewards, scalar_rewards, metrics_dict

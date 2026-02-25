@@ -7,6 +7,33 @@ import wandb
 logger = logging.getLogger(__name__)
 
 
+def _disable_wandb(args, reason: str) -> None:
+    logger.warning("Disabling W&B logging because initialization failed: %s", reason)
+    os.environ["WANDB_MODE"] = "disabled"
+    args.use_wandb = False
+    args.wandb_run_id = None
+
+
+def _init_wandb_fail_open(args, init_kwargs: dict, offline: bool) -> bool:
+    """Initialize W&B and fail open on network/config issues.
+
+    Strategy:
+    1) Try requested mode.
+    2) If init fails, disable W&B and continue training.
+
+    Note: Retrying with a different mode in the same process is unreliable because
+    W&B may have already started an internal session and ignore env-var changes.
+    """
+    try:
+        wandb.init(**init_kwargs)
+        return True
+    except Exception as e:
+        if not offline:
+            logger.warning("W&B online init failed (%s). Continue with W&B disabled.", e)
+        _disable_wandb(args, str(e))
+        return False
+
+
 def _is_offline_mode(args) -> bool:
     """Detect whether W&B should run in offline mode.
 
@@ -38,7 +65,11 @@ def init_wandb_primary(args):
 
     # Only perform explicit login when NOT offline
     if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
+        try:
+            wandb.login(key=args.wandb_key, host=args.wandb_host)
+        except Exception as e:
+            _disable_wandb(args, f"wandb.login failed: {e}")
+            return
 
     # Prepare wandb init parameters
     # add random 6 length string with characters
@@ -71,7 +102,8 @@ def init_wandb_primary(args):
         init_kwargs["dir"] = args.wandb_dir
         logger.info(f"W&B logs will be stored in: {args.wandb_dir}")
 
-    wandb.init(**init_kwargs)
+    if not _init_wandb_fail_open(args, init_kwargs, offline):
+        return
 
     _init_wandb_common()
 
@@ -104,7 +136,11 @@ def init_wandb_secondary(args, router_addr=None):
     offline = _is_offline_mode(args)
 
     if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
+        try:
+            wandb.login(key=args.wandb_key, host=args.wandb_host)
+        except Exception as e:
+            logger.warning("Secondary W&B login failed, skipping secondary tracking: %s", e)
+            return
 
     # Configure settings based on offline/online mode
     if offline:
@@ -142,7 +178,8 @@ def init_wandb_secondary(args, router_addr=None):
         os.makedirs(args.wandb_dir, exist_ok=True)
         init_kwargs["dir"] = args.wandb_dir
 
-    wandb.init(**init_kwargs)
+    if not _init_wandb_fail_open(args, init_kwargs, offline):
+        return
 
     _init_wandb_common()
 

@@ -123,7 +123,9 @@ def test_payload_composition_with_privileged_context(monkeypatch) -> None:
     payload = reward_plugin._build_teacher_payload(args, sample, topk=8)
 
     assert payload["top_logprobs_num"] == 8
-    assert payload["logprob_start_len"] == 5
+    assert payload["logprob_start_len"] == 4
+    assert payload["_opd_teacher_logprob_start_len"] == 5
+    assert payload["_opd_teacher_score_logprob_start_len"] == 4
     assert payload["input_ids"] == [101, 102, 333, 334, 335, 201, 202]
     assert payload["sampling_params"]["max_new_tokens"] == 0
     assert payload["return_logprob"] is True
@@ -141,7 +143,9 @@ def test_payload_composition_without_privileged_context(monkeypatch) -> None:
     payload = reward_plugin._build_teacher_payload(args, sample, topk=16)
 
     assert payload["top_logprobs_num"] == 16
-    assert payload["logprob_start_len"] == 2
+    assert payload["logprob_start_len"] == 1
+    assert payload["_opd_teacher_logprob_start_len"] == 2
+    assert payload["_opd_teacher_score_logprob_start_len"] == 1
     assert payload["input_ids"] == [101, 102, 201, 202]
 
 
@@ -176,6 +180,7 @@ def test_post_process_records_teacher_view_for_debug() -> None:
         },
         "_opd_teacher_input_ids": [1, 2, 3, 4],
         "_opd_teacher_logprob_start_len": 2,
+        "_opd_teacher_score_logprob_start_len": 1,
     }
     sample = SimpleNamespace(
         response_length=2,
@@ -192,3 +197,4 @@ def test_post_process_records_teacher_view_for_debug() -> None:
     assert sample.teacher_topk_token_ids == [[10, 11], [12, 13]]
     assert sample.teacher_input_ids == [1, 2, 3, 4]
     assert sample.teacher_logprob_start_len == 2
+    assert sample.teacher_score_logprob_start_len == 1

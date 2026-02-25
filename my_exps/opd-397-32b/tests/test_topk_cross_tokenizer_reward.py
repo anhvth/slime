@@ -82,7 +82,9 @@ def test_cross_tokenizer_payload_retokenizes_teacher_input(monkeypatch) -> None:
     payload = reward_plugin._build_teacher_payload(args, sample, topk=4)
 
     assert payload["input_ids"] == [301, 201, 202, 203]
-    assert payload["logprob_start_len"] == 1
+    assert payload["logprob_start_len"] == 0
+    assert payload["_opd_teacher_logprob_start_len"] == 1
+    assert payload["_opd_teacher_score_logprob_start_len"] == 0
     assert payload["top_logprobs_num"] == 4
 
 
@@ -228,6 +230,7 @@ def test_post_process_rewards_topk_sets_group_fields_for_cross_mode(monkeypatch)
         },
         "_opd_teacher_input_ids": [301, 201],
         "_opd_teacher_logprob_start_len": 1,
+        "_opd_teacher_score_logprob_start_len": 0,
     }
 
     sample = SimpleNamespace(
@@ -250,6 +253,7 @@ def test_post_process_rewards_topk_sets_group_fields_for_cross_mode(monkeypatch)
     assert sample.teacher_topk_group_lengths == [1]
     assert sample.teacher_topk_group_valid_mask == [1]
     assert sample.teacher_topk_token_ids == [[111]]
+    assert sample.teacher_score_logprob_start_len == 0
 
 
 def test_cross_tokenizer_accepts_none_anchor_logprob_without_crashing(monkeypatch) -> None:
@@ -294,6 +298,111 @@ def test_cross_tokenizer_accepts_none_anchor_logprob_without_crashing(monkeypatc
     assert group_valid_mask == [1]
     assert topk_token_ids == [[111]]
     assert topk_logprobs[0][0] == pytest.approx(-0.2, abs=1e-6)
+
+
+def test_cross_tokenizer_recovers_first_token_when_teacher_has_leading_none_row(monkeypatch) -> None:
+    student_tok = _DummyTokenizer(
+        encode_map={"P": [10], "A": [111]},
+        decode_map={10: "P", 111: "A"},
+    )
+    teacher_tok = _DummyTokenizer(
+        encode_map={"P": [301], "A": [201]},
+        decode_map={301: "P", 201: "A"},
+    )
+
+    monkeypatch.setattr(
+        reward_plugin,
+        "_get_tokenizer",
+        lambda path: student_tok if path == "student" else teacher_tok,
+    )
+
+    args = _make_args(opd_top_logprobs_num=1)
+    sample = SimpleNamespace(tokens=[10, 111], response_length=1, metadata={}, label=None)
+    reward = {
+        "meta_info": {
+            # Teacher scored from one token earlier and returned an unusable first row.
+            "input_top_logprobs": [
+                None,
+                [[-0.2, 901, "A"]],
+            ],
+            "input_token_logprobs": [
+                [None, 999, None],
+                [-0.3, 201, "A"],
+            ],
+        },
+        "_opd_teacher_input_ids": [301, 201],
+        "_opd_teacher_logprob_start_len": 1,
+        "_opd_teacher_score_logprob_start_len": 0,
+    }
+
+    topk_logprobs, topk_token_ids, group_lengths, group_valid_mask = reward_plugin._build_cross_tokenizer_teacher_targets(
+        args,
+        sample,
+        reward,
+        topk=1,
+    )
+
+    assert group_lengths == [1]
+    assert group_valid_mask == [1]
+    assert topk_token_ids == [[111]]
+    assert topk_logprobs[0][0] == pytest.approx(-0.2, abs=1e-6)
+
+
+def test_cross_tokenizer_multitoken_alignment_with_leading_none_row(monkeypatch) -> None:
+    student_tok = _DummyTokenizer(
+        encode_map={"AB": [101], "C": [102], "ZZ": [401, 402], "CC": [501, 502]},
+        decode_map={10: "P", 101: "AB", 102: "C"},
+    )
+    teacher_tok = _DummyTokenizer(
+        encode_map={"P": [301], "ABC": [201, 202, 203]},
+        decode_map={301: "P", 201: "A", 202: "B", 203: "C"},
+    )
+
+    monkeypatch.setattr(
+        reward_plugin,
+        "_get_tokenizer",
+        lambda path: student_tok if path == "student" else teacher_tok,
+    )
+
+    args = _make_args(opd_top_logprobs_num=2)
+    sample = SimpleNamespace(tokens=[10, 101, 102], response_length=2, metadata={}, label=None)
+    reward = {
+        "meta_info": {
+            # Row 0 corresponds to pre-response score and is unusable.
+            "input_top_logprobs": [
+                None,
+                [[-0.1, 910, "AB"], [-0.3, 911, "AB"], [-0.2, 912, "ZZ"]],
+                [[-0.5, 920, "B"]],
+                [[-0.2, 930, "C"], [-1.5, 931, "CC"]],
+            ],
+            "input_token_logprobs": [
+                [None, 999, None],
+                [-0.4, 201, "A"],
+                [-0.7, 202, "B"],
+                [-0.3, 203, "C"],
+            ],
+        },
+        "_opd_teacher_input_ids": [301, 201, 202, 203],
+        "_opd_teacher_logprob_start_len": 1,
+        "_opd_teacher_score_logprob_start_len": 0,
+    }
+
+    topk_logprobs, topk_token_ids, group_lengths, group_valid_mask = reward_plugin._build_cross_tokenizer_teacher_targets(
+        args,
+        sample,
+        reward,
+        topk=2,
+    )
+
+    expected_merged = math.log(math.exp(-0.1 - 0.7) + math.exp(-0.3 - 0.7))
+    assert group_lengths == [1, 1]
+    assert group_valid_mask == [1, 1]
+    assert topk_token_ids[0] == [101, TOPK_PAD_TOKEN_ID]
+    assert topk_logprobs[0][0] == pytest.approx(expected_merged, abs=1e-6)
+    assert topk_logprobs[0][1] == TOPK_PAD_LOGPROB
+    assert topk_token_ids[1] == [102, TOPK_PAD_TOKEN_ID]
+    assert topk_logprobs[1][0] == pytest.approx(-0.2, abs=1e-6)
+    assert topk_logprobs[1][1] == TOPK_PAD_LOGPROB
 
 
 def test_cross_tokenizer_skips_group_when_continuation_logprob_is_none(monkeypatch) -> None:
