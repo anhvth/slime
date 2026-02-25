@@ -28,7 +28,7 @@ STATE = ServerState(
     default_tokenizer_path="",
 )
 
-app = FastAPI(title="OPD Distill Debug Live Viewer", version="1.0")
+app = FastAPI(title="OPD Distill Debug Live Viewer v2", version="2.0")
 
 
 def _tensor_to_list(value: Any, *, dtype: str) -> list[Any]:
@@ -227,7 +227,8 @@ def _build_record_payload(
     position_indices = _tensor_to_list(record.get("position_indices", []), dtype="int")
 
     teacher_start = _safe_int(record.get("teacher_logprob_start_len"), response_start)
-    mode = str(payload.get("mode") or payload.get("recipe", {}).get("distill_loss_mode") or "unknown").lower()
+    recipe = payload.get("recipe") or {}
+    mode = str(payload.get("mode") or recipe.get("distill_loss_mode") or "unknown").lower()
 
     context = {
         "student_prompt": _decode_ids(student_ids[:response_start], tokenizer_path),
@@ -272,7 +273,7 @@ def _build_record_payload(
         recompute["reverse_kl_max_abs_diff"] = float((recomputed_rkl - reverse_tensor).abs().max().item())
 
         if jsd_tensor is not None:
-            beta = float((payload.get("recipe") or {}).get("opd_jsd_beta", 0.5))
+            beta = float(recipe.get("opd_jsd_beta", 0.5))
             mix = beta * teacher_prob + (1.0 - beta) * student_prob
             log_mix = mix.clamp_min(1e-12).log()
             recomputed_jsd = beta * (teacher_prob * (t_norm - log_mix)).sum(dim=-1)
@@ -323,6 +324,58 @@ def _build_record_payload(
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported mode in file: {mode}")
 
+    response_token_ids = student_ids[response_start:response_end]
+    response_token_map = _decode_token_map(tokenizer_path, sorted({int(x) for x in response_token_ids}))
+    response_tokens = [
+        {
+            "response_idx": i,
+            "absolute_idx": response_start + i,
+            "token_id": int(token_id),
+            "token_text": response_token_map.get(str(int(token_id)), str(int(token_id))),
+        }
+        for i, token_id in enumerate(response_token_ids)
+    ]
+
+    logged_position_map: dict[str, int] = {str(i): -1 for i in range(max(0, response_length))}
+    for logged_idx, pos in enumerate(position_indices):
+        if 0 <= pos < response_length:
+            logged_position_map[str(int(pos))] = int(logged_idx)
+
+    warnings: list[str] = []
+    training_effective: list[float]
+    training_effective_label: str
+    if mode == "fkl":
+        training_effective = list(forward_kl)
+        training_effective_label = "forward_kl"
+    elif mode == "rkl":
+        training_effective = list(reverse_kl)
+        training_effective_label = "reverse_kl"
+    elif mode == "jsd":
+        if jsd_vals:
+            training_effective = list(jsd_vals)
+            training_effective_label = "jsd"
+        else:
+            training_effective = list(forward_kl)
+            training_effective_label = "forward_kl_fallback_for_missing_jsd"
+            warnings.append("mode=jsd but jsd tensor is missing; defaulting to forward_kl.")
+    elif mode == "mixed":
+        mixed_weight = float(recipe.get("opd_mixed_kl_weight", 0.5))
+        training_effective = [
+            float(mixed_weight * f + (1.0 - mixed_weight) * r) for f, r in zip(forward_kl, reverse_kl, strict=False)
+        ]
+        training_effective_label = f"mixed_kl(w={mixed_weight:.4f})"
+    else:
+        training_effective = []
+        training_effective_label = "unknown"
+
+    available_metrics = ["training_effective"]
+    if forward_kl:
+        available_metrics.append("forward_kl")
+    if reverse_kl:
+        available_metrics.append("reverse_kl")
+    if jsd_vals:
+        available_metrics.append("jsd")
+
     return {
         "mode": mode,
         "record_idx": record_idx,
@@ -335,11 +388,28 @@ def _build_record_payload(
             "reverse_kl": reverse_kl,
             "jsd": jsd_vals,
         },
+        "loss_detail": {
+            "available_metrics": available_metrics,
+            "default_metric": "training_effective",
+            "training_effective_label": training_effective_label,
+            "warnings": warnings,
+            "per_position": {
+                "training_effective": training_effective,
+                "forward_kl": forward_kl,
+                "reverse_kl": reverse_kl,
+                "jsd": jsd_vals,
+            },
+        },
+        "response_tokens": response_tokens,
+        "logged_position_map": logged_position_map,
+        "inspector_mode_capabilities": {
+            "has_topk_distribution": mode in {"fkl", "mixed", "jsd"},
+        },
         "mass": mass,
         "topk": topk,
         "recompute": recompute,
         "run_dir": str(run_dir),
-        "recipe": payload.get("recipe") or {},
+        "recipe": recipe,
         "writer_rank_info": payload.get("writer_rank_info") or {},
     }
 
@@ -449,7 +519,7 @@ def index() -> HTMLResponse:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>OPD Distill Debug Live Viewer</title>
+  <title>OPD Distill Debug Live Viewer v2</title>
   <style>
     :root {
       --bg: #101217;
@@ -504,16 +574,25 @@ def index() -> HTMLResponse:
       border: none;
       font-weight: 700;
     }
+    .field button:hover { filter: brightness(1.08); }
     .meta {
       color: var(--muted);
       font-size: 12px;
       line-height: 1.5;
       white-space: pre-wrap;
     }
-    .context-wrap {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
+    .token-stream {
+      background: #0d1018;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      color: #ffffff;
+      min-height: 120px;
+      max-height: 320px;
+      overflow: auto;
+      white-space: normal;
+      line-height: 1.45;
+      font-size: 12px;
     }
     .context-box {
       background: #0d1018;
@@ -521,22 +600,52 @@ def index() -> HTMLResponse:
       border-radius: 8px;
       padding: 10px;
       color: #ffffff;
-      min-height: 170px;
-      max-height: 280px;
+      min-height: 120px;
+      max-height: 320px;
       overflow: auto;
       white-space: pre-wrap;
       line-height: 1.45;
       font-size: 12px;
     }
-    .chart {
-      width: 100%;
+    .token {
+      display: inline-block;
+      margin: 2px;
+      padding: 3px 6px;
+      border-radius: 6px;
+      border: 1px solid #2a3246;
+      background: #121a2a;
+      cursor: pointer;
+      user-select: none;
+      max-width: 100%;
+      word-break: break-all;
+    }
+    .token:hover { border-color: #57a7ff; }
+    .token.logged { background: #13211f; border-color: #245e56; }
+    .token.unlogged { opacity: 0.75; }
+    .token.selected {
+      border-color: #f2b14d;
+      outline: 1px solid #f2b14d;
+      background: #2a2314;
+    }
+    .legend { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    .inspector-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .box {
       border: 1px solid var(--border);
       border-radius: 8px;
+      padding: 10px;
       background: #0f1320;
-      padding: 8px;
+      min-height: 100px;
     }
-    canvas { width: 100%; height: 220px; display: block; }
-    .legend { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    .kv { margin: 0; line-height: 1.5; font-size: 12px; }
+    .warn {
+      margin-top: 8px;
+      color: #ffcf73;
+      font-size: 12px;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -550,12 +659,17 @@ def index() -> HTMLResponse:
       vertical-align: top;
     }
     th { color: var(--muted); font-weight: 700; }
+    .bar-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
     .bar {
-      height: 8px;
+      height: 7px;
       border-radius: 5px;
       background: #243046;
       overflow: hidden;
-      min-width: 100px;
+      min-width: 140px;
     }
     .bar-inner-teacher {
       height: 100%;
@@ -566,12 +680,12 @@ def index() -> HTMLResponse:
       background: linear-gradient(90deg, #57a7ff, #3a79d6);
     }
     @media (max-width: 1024px) {
-      .context-wrap { grid-template-columns: 1fr; }
+      .inspector-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
-  <h1>OPD Distill Debug Live Viewer</h1>
+  <h1>OPD Distill Debug Live Viewer v2</h1>
   <div class="controls">
     <div class="grid">
       <div class="field" style="grid-column: span 4;">
@@ -585,10 +699,6 @@ def index() -> HTMLResponse:
       <div class="field" style="grid-column: span 2;">
         <label>Sample</label>
         <select id="sampleSelect"></select>
-      </div>
-      <div class="field" style="grid-column: span 2;">
-        <label>Top-k Position</label>
-        <select id="positionSelect"></select>
       </div>
       <div class="field" style="grid-column: span 6;">
         <label>Tokenizer Path (optional override)</label>
@@ -610,30 +720,35 @@ def index() -> HTMLResponse:
   </div>
 
   <div class="panel">
-    <div class="context-wrap">
-      <div>
-        <div class="legend">Student Prompt + Response (white text)</div>
-        <div id="studentContext" class="context-box"></div>
+    <div class="legend">Input Prompt (student, pre-response)</div>
+    <div id="promptInput" class="context-box"></div>
+  </div>
+
+  <div class="panel">
+    <div class="legend">Generated Rollout Tokens (student response only). Click a token to inspect next-token prediction and loss.</div>
+    <div id="tokenStream" class="token-stream"></div>
+  </div>
+
+  <div class="panel">
+    <div class="inspector-grid">
+      <div class="box">
+        <div class="legend">Token Inspector</div>
+        <div class="field" style="margin-top: 8px;">
+          <label>Loss Metric</label>
+          <select id="lossMetricSelect"></select>
+        </div>
+        <div id="tokenMeta" class="kv"></div>
+        <div id="tokenWarn" class="warn"></div>
       </div>
-      <div>
-        <div class="legend">Teacher Prompt + Response (white text)</div>
-        <div id="teacherContext" class="context-box"></div>
+      <div class="box">
+        <div class="legend">Teacher vs Student Mass (clicked position)</div>
+        <div id="massMeta" class="kv"></div>
       </div>
     </div>
   </div>
 
   <div class="panel">
-    <div class="legend">Loss Curves Across Logged Positions: `forward_kl`, `reverse_kl`, `jsd`</div>
-    <div class="chart"><canvas id="lossCanvas" width="1200" height="220"></canvas></div>
-  </div>
-
-  <div class="panel">
-    <div class="legend">Teacher vs Student Mass View</div>
-    <div class="chart"><canvas id="massCanvas" width="1200" height="220"></canvas></div>
-  </div>
-
-  <div class="panel">
-    <div id="topkTitle" class="legend"></div>
+    <div id="topkTitle" class="legend">Top-k Next Token Distribution</div>
     <table id="topkTable">
       <thead>
         <tr>
@@ -643,12 +758,12 @@ def index() -> HTMLResponse:
           <th>Teacher p</th>
           <th>Student p</th>
           <th>Delta</th>
-          <th>Teacher Mass</th>
-          <th>Student Mass</th>
+          <th>Mass View</th>
         </tr>
       </thead>
       <tbody id="topkBody"></tbody>
     </table>
+    <div id="rklOnlyInfo" class="warn"></div>
   </div>
 
   <script>
@@ -656,17 +771,19 @@ def index() -> HTMLResponse:
       run: document.getElementById("runSelect"),
       step: document.getElementById("stepSelect"),
       sample: document.getElementById("sampleSelect"),
-      position: document.getElementById("positionSelect"),
       tokenizer: document.getElementById("tokenizerInput"),
       refresh: document.getElementById("refreshBtn"),
       status: document.getElementById("status"),
       summary: document.getElementById("summaryMeta"),
-      studentContext: document.getElementById("studentContext"),
-      teacherContext: document.getElementById("teacherContext"),
-      lossCanvas: document.getElementById("lossCanvas"),
-      massCanvas: document.getElementById("massCanvas"),
+      promptInput: document.getElementById("promptInput"),
+      tokenStream: document.getElementById("tokenStream"),
+      lossMetric: document.getElementById("lossMetricSelect"),
+      tokenMeta: document.getElementById("tokenMeta"),
+      tokenWarn: document.getElementById("tokenWarn"),
+      massMeta: document.getElementById("massMeta"),
       topkTitle: document.getElementById("topkTitle"),
       topkBody: document.getElementById("topkBody"),
+      rklOnlyInfo: document.getElementById("rklOnlyInfo"),
     };
 
     const state = {
@@ -674,7 +791,9 @@ def index() -> HTMLResponse:
       steps: [],
       samples: [],
       record: null,
-      positionIdx: 0,
+      selectedResponseIdx: -1,
+      selectedLoggedIdx: -1,
+      selectedMetric: "training_effective",
     };
 
     function setStatus(text) {
@@ -693,97 +812,16 @@ def index() -> HTMLResponse:
       return s / arr.length;
     }
 
-    function quantile(arr, q) {
-      if (!arr || arr.length === 0) return NaN;
-      const copy = [...arr].map(Number).sort((a, b) => a - b);
-      const idx = Math.min(copy.length - 1, Math.max(0, Math.floor(q * (copy.length - 1))));
-      return copy[idx];
-    }
-
-    function drawSeries(canvas, seriesList, colors) {
-      const ctx = canvas.getContext("2d");
-      const dpr = window.devicePixelRatio || 1;
-      const cssWidth = canvas.clientWidth || 1200;
-      const cssHeight = canvas.clientHeight || 220;
-      canvas.width = Math.floor(cssWidth * dpr);
-      canvas.height = Math.floor(cssHeight * dpr);
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-      const width = cssWidth;
-      const height = cssHeight;
-      ctx.clearRect(0, 0, width, height);
-      ctx.fillStyle = "#0f1320";
-      ctx.fillRect(0, 0, width, height);
-
-      const padLeft = 40;
-      const padRight = 10;
-      const padTop = 10;
-      const padBottom = 24;
-      const plotW = Math.max(10, width - padLeft - padRight);
-      const plotH = Math.max(10, height - padTop - padBottom);
-
-      let flat = [];
-      for (const s of seriesList) {
-        if (!s) continue;
-        for (const v of s) {
-          const n = Number(v);
-          if (Number.isFinite(n)) flat.push(n);
-        }
-      }
-      if (flat.length === 0) {
-        ctx.fillStyle = "#8e95a3";
-        ctx.fillText("No numeric values to plot", 12, 20);
-        return;
-      }
-      const minV = Math.min(...flat);
-      const maxV = Math.max(...flat);
-      const lo = minV;
-      const hi = (maxV === minV) ? maxV + 1e-6 : maxV;
-
-      ctx.strokeStyle = "#283247";
-      ctx.lineWidth = 1;
-      for (let i = 0; i <= 4; i += 1) {
-        const y = padTop + (plotH * i / 4);
-        ctx.beginPath();
-        ctx.moveTo(padLeft, y);
-        ctx.lineTo(padLeft + plotW, y);
-        ctx.stroke();
-      }
-
-      function xOf(i, n) {
-        if (n <= 1) return padLeft;
-        return padLeft + (i / (n - 1)) * plotW;
-      }
-      function yOf(v) {
-        return padTop + (1 - (v - lo) / (hi - lo)) * plotH;
-      }
-
-      for (let si = 0; si < seriesList.length; si += 1) {
-        const s = seriesList[si];
-        if (!s || s.length === 0) continue;
-        ctx.strokeStyle = colors[si] || "#ffffff";
-        ctx.lineWidth = 1.6;
-        ctx.beginPath();
-        for (let i = 0; i < s.length; i += 1) {
-          const v = Number(s[i]);
-          if (!Number.isFinite(v)) continue;
-          const x = xOf(i, s.length);
-          const y = yOf(v);
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }
-        ctx.stroke();
-      }
-
-      ctx.fillStyle = "#8e95a3";
-      ctx.font = "11px monospace";
-      ctx.fillText(`min=${lo.toFixed(4)}`, 8, height - 8);
-      ctx.fillText(`max=${hi.toFixed(4)}`, width - 110, height - 8);
-    }
-
     function safeText(s) {
       if (s === null || s === undefined) return "";
       return String(s);
+    }
+
+    function esc(s) {
+      return safeText(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
     }
 
     function populateSelect(selectEl, items, valueKey, labelKey) {
@@ -853,59 +891,177 @@ def index() -> HTMLResponse:
       await loadRecord();
     }
 
-    function updatePositionSelect(positionIndices) {
-      const items = (positionIndices || []).map((pos, i) => ({
-        id: String(i),
-        label: `i=${i} pos=${pos}`,
-      }));
-      populateSelect(els.position, items, "id", "label");
-      if (items.length > 0) {
-        els.position.value = "0";
-        state.positionIdx = 0;
+    function selectInitialToken() {
+      const p = state.record?.payload;
+      if (!p) return;
+      const tokens = p.response_tokens || [];
+      if (tokens.length === 0) {
+        state.selectedResponseIdx = -1;
+        state.selectedLoggedIdx = -1;
+        return;
+      }
+      const map = p.logged_position_map || {};
+      let firstLogged = -1;
+      for (const t of tokens) {
+        const li = Number(map[String(t.response_idx)] ?? -1);
+        if (li >= 0) {
+          firstLogged = Number(t.response_idx);
+          break;
+        }
+      }
+      state.selectedResponseIdx = firstLogged >= 0 ? firstLogged : 0;
+      state.selectedLoggedIdx = Number(map[String(state.selectedResponseIdx)] ?? -1);
+    }
+
+    function renderLossMetricSelect() {
+      const p = state.record?.payload;
+      if (!p) return;
+      const options = (p.loss_detail?.available_metrics || []).map(x => ({ id: x, label: x }));
+      if (options.length === 0) {
+        els.lossMetric.innerHTML = "";
+        return;
+      }
+      populateSelect(els.lossMetric, options, "id", "label");
+      const ids = options.map(x => x.id);
+      const def = p.loss_detail?.default_metric || "training_effective";
+      if (!ids.includes(state.selectedMetric)) {
+        state.selectedMetric = ids.includes(def) ? def : ids[0];
+      }
+      els.lossMetric.value = state.selectedMetric;
+    }
+
+    function renderTokenStream() {
+      const p = state.record?.payload;
+      els.tokenStream.innerHTML = "";
+      if (!p) return;
+      const tokens = p.response_tokens || [];
+      const map = p.logged_position_map || {};
+      if (tokens.length === 0) {
+        els.tokenStream.textContent = "No response tokens in selected sample.";
+        return;
+      }
+      for (const token of tokens) {
+        const responseIdx = Number(token.response_idx);
+        const loggedIdx = Number(map[String(responseIdx)] ?? -1);
+        const span = document.createElement("span");
+        span.className = `token ${loggedIdx >= 0 ? "logged" : "unlogged"} ${responseIdx === state.selectedResponseIdx ? "selected" : ""}`;
+        span.innerHTML = esc(token.token_text);
+        span.title = `response_idx=${responseIdx}, token_id=${token.token_id}, logged_idx=${loggedIdx}`;
+        span.addEventListener("click", () => {
+          state.selectedResponseIdx = responseIdx;
+          state.selectedLoggedIdx = loggedIdx;
+          renderTokenStream();
+          renderInspector();
+        });
+        els.tokenStream.appendChild(span);
       }
     }
 
-    function renderTopkTable() {
-      els.topkBody.innerHTML = "";
-      const payload = state.record?.payload;
-      if (!payload) return;
-      const mode = payload.mode;
-      const posIdx = Number(els.position.value || 0);
-      state.positionIdx = posIdx;
+    function metricValue(metricKey, loggedIdx) {
+      const per = state.record?.payload?.loss_detail?.per_position || {};
+      const arr = per[metricKey] || [];
+      if (loggedIdx < 0 || loggedIdx >= arr.length) return null;
+      return Number(arr[loggedIdx]);
+    }
 
-      if (!["fkl", "mixed", "jsd"].includes(mode)) {
-        els.topkTitle.textContent = "RKL mode: no teacher top-k table in this dump.";
+    function renderInspector() {
+      els.topkBody.innerHTML = "";
+      els.rklOnlyInfo.textContent = "";
+      els.tokenWarn.textContent = "";
+      els.massMeta.textContent = "";
+
+      const p = state.record?.payload;
+      if (!p) return;
+      const token = (p.response_tokens || []).find(x => Number(x.response_idx) === state.selectedResponseIdx);
+      if (!token) {
+        els.tokenMeta.textContent = "No token selected.";
+        els.topkTitle.textContent = "Top-k Next Token Distribution";
         return;
       }
 
-      const topk = payload.topk;
-      const tokenIds = topk.token_ids[posIdx] || [];
-      const tProbs = topk.teacher_probs[posIdx] || [];
-      const sProbs = topk.student_probs[posIdx] || [];
-      const pos = payload.position_indices[posIdx];
-      const fkl = payload.loss.forward_kl[posIdx];
-      const rkl = payload.loss.reverse_kl[posIdx];
-      const jsd = (payload.loss.jsd || [])[posIdx];
-      els.topkTitle.textContent =
-        `Position i=${posIdx} token_pos=${pos} | fkl=${fmt(fkl, 4)} rkl=${fmt(rkl, 4)} jsd=${fmt(jsd, 4)}`;
+      const loggedIdx = state.selectedLoggedIdx;
+      const mode = p.mode;
+      const metric = state.selectedMetric;
+      const metricValueSelected = metricValue(metric, loggedIdx);
+      const fkl = metricValue("forward_kl", loggedIdx);
+      const rkl = metricValue("reverse_kl", loggedIdx);
+      const jsd = metricValue("jsd", loggedIdx);
+      const trainingEffective = metricValue("training_effective", loggedIdx);
+
+      const commonMeta = [
+        `response_idx=${token.response_idx} absolute_idx=${token.absolute_idx}`,
+        `token_id=${token.token_id}`,
+        `token_text=${safeText(token.token_text)}`,
+        `mode=${mode}`,
+        `logged_position_idx=${loggedIdx}`,
+        `selected_metric=${metric} value=${fmt(metricValueSelected, 6)}`,
+        `training_effective(${p.loss_detail?.training_effective_label || "n/a"})=${fmt(trainingEffective, 6)}`,
+        `forward_kl=${fmt(fkl, 6)} reverse_kl=${fmt(rkl, 6)} jsd=${fmt(jsd, 6)}`,
+      ];
+      els.tokenMeta.textContent = commonMeta.join("\\n");
+
+      if (loggedIdx < 0) {
+        els.tokenWarn.textContent = "This token is not logged in position_indices for this dump.";
+        els.topkTitle.textContent = "Top-k Next Token Distribution";
+        els.massMeta.textContent = "Mass view unavailable because selected token is not logged.";
+        return;
+      }
+      const warnList = p.loss_detail?.warnings || [];
+      if (warnList.length > 0) {
+        els.tokenWarn.textContent = warnList.join(" | ");
+      }
+
+      const position = (p.position_indices || [])[loggedIdx];
+      els.topkTitle.textContent = `Logged position i=${loggedIdx}, response_pos=${position}`;
+
+      if (!p.inspector_mode_capabilities?.has_topk_distribution) {
+        const stLogP = Number((p.topk?.student_log_probs || [])[loggedIdx]);
+        const tcLogP = Number((p.topk?.teacher_log_probs || [])[loggedIdx]);
+        const stP = Number((p.mass?.student_prob || [])[loggedIdx]);
+        const tcP = Number((p.mass?.teacher_prob || [])[loggedIdx]);
+        const gap = Number((p.mass?.prob_gap_abs || [])[loggedIdx]);
+        els.rklOnlyInfo.textContent = "RKL dump: top-k candidates are unavailable. Showing scalar probabilities only.";
+        els.massMeta.textContent =
+          `student_prob=${fmt(stP, 6)} teacher_prob=${fmt(tcP, 6)} | abs_gap=${fmt(gap, 6)}\\n` +
+          `student_log_prob=${fmt(stLogP, 6)} teacher_log_prob=${fmt(tcLogP, 6)} reverse_kl=${fmt(rkl, 6)}`;
+        return;
+      }
+
+      const topk = p.topk || {};
+      const tokenIds = (topk.token_ids || [])[loggedIdx] || [];
+      const tProbs = (topk.teacher_probs || [])[loggedIdx] || [];
+      const sProbs = (topk.student_probs || [])[loggedIdx] || [];
+
+      const teacherTop1 = Math.max(...tProbs.map(Number));
+      const studentTop1 = Math.max(...sProbs.map(Number));
+      let tv = 0;
+      for (let i = 0; i < tokenIds.length; i += 1) {
+        tv += Math.abs(Number(tProbs[i] || 0) - Number(sProbs[i] || 0));
+      }
+      tv *= 0.5;
+      els.massMeta.textContent =
+        `teacher_top1_mass=${fmt(teacherTop1, 6)} student_top1_mass=${fmt(studentTop1, 6)} tv_distance=${fmt(tv, 6)}`;
 
       for (let i = 0; i < tokenIds.length; i += 1) {
-        const tid = tokenIds[i];
+        const tid = Number(tokenIds[i]);
         const tok = (topk.token_map && topk.token_map[String(tid)]) ? topk.token_map[String(tid)] : "";
         const tp = Number(tProbs[i] || 0);
         const sp = Number(sProbs[i] || 0);
         const delta = sp - tp;
-
         const tr = document.createElement("tr");
         tr.innerHTML = `
           <td>${i + 1}</td>
           <td>${tid}</td>
-          <td>${safeText(tok).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</td>
+          <td>${esc(tok)}</td>
           <td>${fmt(tp, 5)}</td>
           <td>${fmt(sp, 5)}</td>
           <td>${fmt(delta, 5)}</td>
-          <td><div class="bar"><div class="bar-inner-teacher" style="width:${Math.max(0, Math.min(100, tp * 100))}%"></div></div></td>
-          <td><div class="bar"><div class="bar-inner-student" style="width:${Math.max(0, Math.min(100, sp * 100))}%"></div></div></td>
+          <td>
+            <div class="bar-wrap">
+              <div class="bar"><div class="bar-inner-teacher" style="width:${Math.max(0, Math.min(100, tp * 100))}%"></div></div>
+              <div class="bar"><div class="bar-inner-student" style="width:${Math.max(0, Math.min(100, sp * 100))}%"></div></div>
+            </div>
+          </td>
         `;
         els.topkBody.appendChild(tr);
       }
@@ -915,51 +1071,31 @@ def index() -> HTMLResponse:
       const data = state.record;
       if (!data) return;
       const p = data.payload;
+      const sc = p.context || {};
+      const prompt = safeText(sc.student_prompt);
 
-      const f = p.loss.forward_kl || [];
-      const r = p.loss.reverse_kl || [];
-      const j = p.loss.jsd || [];
       const summaryLines = [
         `run_dir: ${p.run_dir}`,
         `file: ${data.file}`,
         `mode: ${p.mode}`,
         `rollout_id: ${data.rollout_id}`,
         `sample_index: ${p.sample_index} microbatch_sample_index: ${p.microbatch_sample_index}`,
+        `response_tokens: ${(p.response_tokens || []).length}`,
+        `logged_positions: ${(p.position_indices || []).length}`,
         `tokenizer_path: ${data.tokenizer_path || "(none)"}`,
         `tokenizer_error: ${data.tokenizer_error || "(none)"}`,
         `recipe: ${JSON.stringify(p.recipe)}`,
         `writer_rank_info: ${JSON.stringify(p.writer_rank_info)}`,
         `recompute_diff: ${JSON.stringify(p.recompute)}`,
-        `loss_stats: fkl_mean=${fmt(mean(f), 4)} fkl_p95=${fmt(quantile(f, 0.95), 4)} | ` +
-          `rkl_mean=${fmt(mean(r), 4)} rkl_p95=${fmt(quantile(r, 0.95), 4)} | ` +
-          `jsd_mean=${fmt(mean(j), 4)} jsd_p95=${fmt(quantile(j, 0.95), 4)}`,
+        `training_effective_label: ${p.loss_detail?.training_effective_label || "n/a"}`,
+        `training_effective_mean=${fmt(mean((p.loss_detail?.per_position || {}).training_effective || []), 6)}`,
       ];
       els.summary.textContent = summaryLines.join("\\n");
-
-      const sc = p.context;
-      els.studentContext.textContent =
-        `[student_prompt]\\n${safeText(sc.student_prompt)}\\n\\n[student_response]\\n${safeText(sc.student_response)}`;
-      els.teacherContext.textContent =
-        `[teacher_prompt]\\n${safeText(sc.teacher_prompt)}\\n\\n[teacher_response]\\n${safeText(sc.teacher_response)}`;
-
-      drawSeries(els.lossCanvas, [f, r, j], ["#26d7ae", "#57a7ff", "#f2b14d"]);
-
-      if (p.mode === "rkl") {
-        drawSeries(
-          els.massCanvas,
-          [p.mass.student_prob || [], p.mass.teacher_prob || [], p.mass.prob_gap_abs || []],
-          ["#57a7ff", "#26d7ae", "#ff6e6e"]
-        );
-      } else {
-        drawSeries(
-          els.massCanvas,
-          [p.mass.teacher_top1_mass || [], p.mass.student_top1_mass || [], p.mass.tv_distance || []],
-          ["#26d7ae", "#57a7ff", "#ff6e6e"]
-        );
-      }
-
-      updatePositionSelect(p.position_indices || []);
-      renderTopkTable();
+      els.promptInput.textContent = prompt || "(empty prompt)";
+      renderLossMetricSelect();
+      selectInitialToken();
+      renderTokenStream();
+      renderInspector();
       setStatus(`Loaded rollout=${data.rollout_id} mode=${p.mode} sample=${p.record_idx}`);
     }
 
@@ -989,8 +1125,9 @@ def index() -> HTMLResponse:
     els.sample.addEventListener("change", async () => {
       await loadRecord();
     });
-    els.position.addEventListener("change", () => {
-      renderTopkTable();
+    els.lossMetric.addEventListener("change", () => {
+      state.selectedMetric = els.lossMetric.value || "training_effective";
+      renderInspector();
     });
     els.refresh.addEventListener("click", async () => {
       await loadSteps();
@@ -1015,7 +1152,7 @@ def index() -> HTMLResponse:
 
 def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[2]
-    parser = argparse.ArgumentParser(description="Live web viewer for OPD debug dump .pt files.")
+    parser = argparse.ArgumentParser(description="Live web viewer v2 for OPD debug dump .pt files.")
     parser.add_argument(
         "--runs-root",
         type=str,
@@ -1037,9 +1174,9 @@ def main() -> None:
     args = parse_args()
     STATE.runs_root = Path(args.runs_root).resolve()
     STATE.default_tokenizer_path = args.tokenizer_path.strip()
-    print(f"[debug_dump_live_server] runs_root={STATE.runs_root}")
+    print(f"[debug_dump_live_server_v2] runs_root={STATE.runs_root}")
     if STATE.default_tokenizer_path:
-        print(f"[debug_dump_live_server] default_tokenizer={STATE.default_tokenizer_path}")
+        print(f"[debug_dump_live_server_v2] default_tokenizer={STATE.default_tokenizer_path}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

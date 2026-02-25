@@ -141,7 +141,8 @@ def _retention_limits(args: Namespace) -> tuple[int, int]:
 
 def _sampling_limits(args: Namespace) -> tuple[int, int]:
     max_samples = max(1, _safe_int(getattr(args, "opd_debug_dump_max_samples_per_update", 8), 8))
-    max_positions = max(1, _safe_int(getattr(args, "opd_debug_dump_max_positions_per_sample", 512), 512))
+    # 0 means "log all response positions" for each kept sample.
+    max_positions = max(0, _safe_int(getattr(args, "opd_debug_dump_max_positions_per_sample", 0), 0))
     return max_samples, max_positions
 
 
@@ -166,6 +167,8 @@ def _reserve_update_key(mode: str, rollout_id: int) -> bool:
 def _to_position_index_tensor(length: int, max_positions: int, rng: random.Random) -> torch.Tensor:
     if length <= 0:
         return torch.empty((0,), dtype=torch.long)
+    if max_positions <= 0:
+        return torch.arange(length, dtype=torch.long)
     if length <= max_positions:
         return torch.arange(length, dtype=torch.long)
     selected = rng.sample(range(length), k=max_positions)

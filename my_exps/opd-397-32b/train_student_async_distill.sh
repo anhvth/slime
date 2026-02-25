@@ -350,7 +350,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}" \
   --rollout-top-p "${ROLLOUT_TOP_P}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE}" \
-  --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-5}" \
+  --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-1}" \
   --balance-data \
   --optimizer adam \
   --lr "${LR}" \

@@ -1,4 +1,4 @@
-distill_loss_mode: fkl
+distill_loss_mode: jsd
 opd_debug_dump_enable: 1
 opd_debug_dump_dir: ""
 opd_debug_dump_max_total_mb: 5120
@@ -22,3 +22,4 @@ opd_rm_max_connections_per_host: 256
 opd_rm_retry_attempts: 6
 opd_rm_retry_base_sleep_s: 0.15
 opd_rm_retry_max_sleep_s: 2.0
+opd_jsd_beta: 0.5
