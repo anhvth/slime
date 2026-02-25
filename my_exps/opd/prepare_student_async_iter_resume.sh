@@ -9,10 +9,10 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 MEGATRON_PYTHONPATH="${MEGATRON_PYTHONPATH:-/root/Megatron-LM}"
 MODEL_CONFIG_SCRIPT="${MODEL_CONFIG_SCRIPT:-${REPO_ROOT}/scripts/models/qwen3-32B-as-qwen35.sh}"
 
-INPUT_ITER_DIR="${INPUT_ITER_DIR:-${REPO_ROOT}/outputs/opd-397-32b/student_async/iter_0001599}"
+INPUT_ITER_DIR="${INPUT_ITER_DIR:-${REPO_ROOT}/outputs/opd/student_async/iter_0001599}"
 RESUME_ITER_TAG="${RESUME_ITER_TAG:-iter_0001599}"
-OUTPUT_HF_DIR="${OUTPUT_HF_DIR:-${REPO_ROOT}/outputs/opd-397-32b/student_async_hf/${RESUME_ITER_TAG}}"
-OUTPUT_DIST_DIR="${OUTPUT_DIST_DIR:-${REPO_ROOT}/outputs/opd-397-32b/student_async_hf/${RESUME_ITER_TAG}_torch_dist}"
+OUTPUT_HF_DIR="${OUTPUT_HF_DIR:-${REPO_ROOT}/outputs/opd/student_async_hf/${RESUME_ITER_TAG}}"
+OUTPUT_DIST_DIR="${OUTPUT_DIST_DIR:-${REPO_ROOT}/outputs/opd/student_async_hf/${RESUME_ITER_TAG}_torch_dist}"
 ORIGIN_HF_DIR="${ORIGIN_HF_DIR:-$HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned}"
 
 OVERWRITE_OUTPUT_DIST="${OVERWRITE_OUTPUT_DIST:-0}"
@@ -89,7 +89,7 @@ if [[ ! -f "${OUTPUT_DIST_DIR}/.metadata" && ! -f "${OUTPUT_DIST_DIR}/metadata.j
   exit 1
 fi
 
-SUGGESTED_SAVE="${REPO_ROOT}/outputs/opd-397-32b/student_async_distill_privileged_from_${RESUME_ITER_TAG}"
+SUGGESTED_SAVE="${REPO_ROOT}/outputs/opd/student_async_distill_privileged_from_${RESUME_ITER_TAG}"
 DEFAULT_PROMPT_DATA="${REPO_ROOT}/datasets/50k_prompt_for_distillation_privileged.jsonl"
 
 echo
@@ -104,5 +104,5 @@ export STUDENT_REF_LOAD="${OUTPUT_DIST_DIR}"
 export STUDENT_LOAD="${OUTPUT_DIST_DIR}"
 export STUDENT_SAVE="${SUGGESTED_SAVE}"
 export PROMPT_DATA="${DEFAULT_PROMPT_DATA}"
-bash my_exps/opd-397-32b/train_student_async_jsd_with_privileged_infomation.sh
+bash my_exps/opd/train_student_async_jsd_with_privileged_infomation.sh
 EOF

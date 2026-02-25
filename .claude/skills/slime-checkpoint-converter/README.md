@@ -9,7 +9,7 @@ This skill converts SLIME training checkpoints to HuggingFace format.
 Simply ask Claude to convert a checkpoint:
 
 ```
-Convert outputs/opd-397-32b/student_async/iter_0000699 to HF
+Convert outputs/opd/student_async/iter_0000699 to HF
 ```
 
 Claude will automatically:
@@ -22,8 +22,8 @@ Claude will automatically:
 
 ```bash
 .github/slime-checkpoint-converter/scripts/convert_checkpoint.sh \
-    outputs/opd-397-32b/student_async/iter_0000699 \
-    outputs/opd-397-32b/hf/iter_0000699
+    outputs/opd/student_async/iter_0000699 \
+    outputs/opd/hf/iter_0000699
 ```
 
 The script auto-detects:
@@ -39,8 +39,8 @@ source scripts/models/qwen3-32B-as-qwen35.sh
 
 # 2. Run conversion
 PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py \
-    --input-dir outputs/opd-397-32b/student_async/iter_0000699 \
-    --output-dir outputs/opd-397-32b/hf/iter_0000699 \
+    --input-dir outputs/opd/student_async/iter_0000699 \
+    --output-dir outputs/opd/hf/iter_0000699 \
     --origin-hf-dir $HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned/ \
     --vocab-size 248320
 ```

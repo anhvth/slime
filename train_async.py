@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import os
 import time
 
 import ray
@@ -11,6 +12,55 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
 
 logger = logging.getLogger(__name__)
+
+
+def _get_debug_heartbeat_seconds() -> float:
+    raw_val = os.environ.get("SLIME_DEBUG_HEARTBEAT_SECONDS", "10")
+    try:
+        seconds = float(raw_val)
+    except ValueError:
+        logger.warning(
+            "[DEBUG] Invalid SLIME_DEBUG_HEARTBEAT_SECONDS=%r. Falling back to 10.0s.",
+            raw_val,
+        )
+        return 10.0
+    return max(0.0, seconds)
+
+
+def _ray_get_with_heartbeat(obj_ref, *, stage_name: str):
+    heartbeat = _get_debug_heartbeat_seconds()
+    if heartbeat <= 0:
+        return ray.get(obj_ref)
+
+    # Handle both single ObjectRef and list of ObjectRefs
+    if isinstance(obj_ref, list):
+        refs = list(obj_ref)
+    else:
+        refs = [obj_ref]
+
+    start = time.perf_counter()
+    heartbeat_count = 0
+    while True:
+        ready, refs_remaining = ray.wait(refs, num_returns=len(refs), timeout=heartbeat)
+        if len(ready) == len(refs):
+            result = ray.get(ready)
+            logger.info(
+                "[DEBUG] %s finished in %.2fs",
+                stage_name,
+                time.perf_counter() - start,
+            )
+            return result if isinstance(obj_ref, list) else result[0]
+
+        refs = ready + refs_remaining  # keep waiting on all
+        heartbeat_count += 1
+        logger.info(
+            "[DEBUG] Waiting for %s (elapsed=%.2fs, heartbeat=%s, ready=%d/%d)",
+            stage_name,
+            time.perf_counter() - start,
+            heartbeat_count,
+            len(ready),
+            len(ready) + len(refs_remaining),
+        )
 
 
 def _is_cancelled_rollout_error(exc: BaseException) -> bool:
@@ -31,7 +81,10 @@ def _get_rollout_data_with_retry(args, rollout_manager, rollout_data_future, rol
     for attempt_idx in range(total_attempts):
         attempt = attempt_idx + 1
         try:
-            return ray.get(rollout_data_future)
+            return _ray_get_with_heartbeat(
+                rollout_data_future,
+                stage_name=f"rollout_manager.generate(rollout_id={rollout_id}, attempt={attempt}/{total_attempts})",
+            )
         except Exception as exc:
             if not _is_cancelled_rollout_error(exc):
                 raise
@@ -107,10 +160,21 @@ def train(args):
         if args.use_critic:
             critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if rollout_id >= args.num_critic_only_steps:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
-            ray.get(critic_train_handle)
+                actor_train_handle = actor_model.async_train(rollout_id, rollout_data_curr_ref)
+                _ray_get_with_heartbeat(
+                    actor_train_handle,
+                    stage_name=f"actor_model.async_train(rollout_id={rollout_id})",
+                )
+            _ray_get_with_heartbeat(
+                critic_train_handle,
+                stage_name=f"critic_model.async_train(rollout_id={rollout_id})",
+            )
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+            actor_train_handle = actor_model.async_train(rollout_id, rollout_data_curr_ref)
+            _ray_get_with_heartbeat(
+                actor_train_handle,
+                stage_name=f"actor_model.async_train(rollout_id={rollout_id})",
+            )
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             actor_model.save_model(
@@ -123,7 +187,10 @@ def train(args):
                     force_sync=rollout_id == args.num_rollout - 1,
                 )
             if args.rollout_global_dataset:
-                ray.get(rollout_manager.save.remote(rollout_id))
+                _ray_get_with_heartbeat(
+                    rollout_manager.save.remote(rollout_id),
+                    stage_name=f"rollout_manager.save(rollout_id={rollout_id})",
+                )
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
             # sync generate before update weights to prevent update weight in the middle of generation
@@ -137,9 +204,15 @@ def train(args):
             actor_model.update_weights()
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            _ray_get_with_heartbeat(
+                rollout_manager.eval.remote(rollout_id),
+                stage_name=f"rollout_manager.eval(rollout_id={rollout_id})",
+            )
 
-    ray.get(rollout_manager.dispose.remote())
+    _ray_get_with_heartbeat(
+        rollout_manager.dispose.remote(),
+        stage_name="rollout_manager.dispose()",
+    )
 
 
 if __name__ == "__main__":

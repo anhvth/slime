@@ -24,7 +24,7 @@ if [[ -z "${CHECKPOINT_PATH}" ]] || [[ -z "${OUTPUT_PATH}" ]]; then
     echo "  origin-hf-dir    Original HF model directory (default: auto-detect)"
     echo ""
     echo "Examples:"
-    echo "  $0 outputs/opd-397-32b/student_async/iter_0000699 outputs/opd-397-32b/hf/iter_0000699"
+    echo "  $0 outputs/opd/student_async/iter_0000699 outputs/opd/hf/iter_0000699"
     echo "  $0 outputs/exp/iter_0000100 outputs/hf scripts/models/qwen3-32B-as-qwen35.sh"
     exit 1
 fi

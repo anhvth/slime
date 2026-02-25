@@ -127,7 +127,7 @@ fi
 export PROMPT_DATA="${PROMPT_DATA:-${REPO_ROOT}/datasets/50k_prompt_for_distillation_privileged.jsonl}"
 export STUDENT_HF_CHECKPOINT="${STUDENT_HF_CHECKPOINT:-${RESUME_HF_DIR}}"
 export STUDENT_REF_LOAD="${STUDENT_REF_LOAD:-${RESUME_DIST_DIR}}"
-export STUDENT_SAVE="${STUDENT_SAVE:-${REPO_ROOT}/outputs/opd-397-32b/student_async_distill_privileged_from_${RESUME_SAVE_TAG}}"
+export STUDENT_SAVE="${STUDENT_SAVE:-${REPO_ROOT}/outputs/opd/student_async_distill_privileged_from_${RESUME_SAVE_TAG}}"
 export RESUME_FROM_SAVE="${RESUME_FROM_SAVE:-1}"
 
 # 15-node async layout defaults (120 GPUs total): 48 train (6 nodes) + 72 rollout (9 nodes).

@@ -40,21 +40,21 @@ logprobs can be used directly — no runtime mapping needed.
 - Student converted: `~/ckpt/hf_models/Qwen/Qwen3-32B-as-Qwen35/`
 
 ## Scripts In This Folder
-- `my_exps/opd-397-32b/serve_teacher.sh` — start teacher SGLang server
-- `my_exps/opd-397-32b/train_student.sh` — launch OPD training
-- `my_exps/opd-397-32b/convert_qwen3_to_qwen35_vocab.py` — one-time vocab conversion
-- `my_exps/opd-397-32b/mapping_qwen_35.csv` — shared-token mapping (131612 pairs)
+- `my_exps/opd/serve_teacher.sh` — start teacher SGLang server
+- `my_exps/opd/train_student.sh` — launch OPD training
+- `my_exps/opd/convert_qwen3_to_qwen35_vocab.py` — one-time vocab conversion
+- `my_exps/opd/mapping_qwen_35.csv` — shared-token mapping (131612 pairs)
 
 ## Runbook
 
 ### 0. Convert student vocab (one-time)
 ```bash
 cd ~/slime
-python my_exps/opd-397-32b/convert_qwen3_to_qwen35_vocab.py \
+python my_exps/opd/convert_qwen3_to_qwen35_vocab.py \
     --src ~/home-trained-model/Stage3_SFT_Epoch3 \
     --out ~/ckpt/hf_models/Qwen/Qwen3-32B-as-Qwen35 \
     --teacher-tokenizer ~/ckpt/hf_models/Qwen/Qwen3.5-397B-A17B-FP8 \
-    --csv my_exps/opd-397-32b/mapping_qwen_35.csv
+    --csv my_exps/opd/mapping_qwen_35.csv
 ```
 
 ### 1. Teacher is already running on worker-15:13141.
@@ -67,7 +67,7 @@ curl http://worker-15:13141/get_model_info
 ### 2. Start OPD training on trainer node.
 ```bash
 cd ~/slime
-bash my_exps/opd-397-32b/train_student.sh
+bash my_exps/opd/train_student.sh
 ```
 (Default TEACHER_HOST is `worker-15`, no override needed.)
 
@@ -75,14 +75,14 @@ bash my_exps/opd-397-32b/train_student.sh
 1. Start debug teacher.
 ```bash
 cd ~/slime
-bash my_exps/opd-397-32b/serve_teacher.sh --debug
+bash my_exps/opd/serve_teacher.sh --debug
 ```
 
 2. Run debug student.
 ```bash
 cd ~/slime
 TEACHER_HOST=127.0.0.1 \
-  bash my_exps/opd-397-32b/train_student.sh --debug
+  bash my_exps/opd/train_student.sh --debug
 ```
 
 ## Important Defaults
@@ -97,11 +97,11 @@ TEACHER_HOST=127.0.0.1 \
 ## Override Examples
 ```bash
 TEACHER_TP=8 TEACHER_MEM_FRACTION_STATIC=0.8 \
-  bash my_exps/opd-397-32b/serve_teacher.sh
+  bash my_exps/opd/serve_teacher.sh
 ```
 
 ```bash
 PROMPT_DATA=$HOME/ckpt/dapo-math-17k/dapo-math-17k.jsonl \
 EVAL_PROMPT_DATA=$HOME/ckpt/aime-2024/aime-2024.jsonl \
-  bash my_exps/opd-397-32b/train_student.sh
+  bash my_exps/opd/train_student.sh
 ```

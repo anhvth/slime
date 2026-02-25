@@ -7,7 +7,7 @@ Mode: async distill + `DISTILL_LOSS_MODE=jsd` + privileged context (`50k_prompt_
 
 ## Snapshot metrics (last ~8k log lines)
 
-Source: `my_exps/opd-397-32b/perf_tools/analyze_training_perf.py`
+Source: `my_exps/opd/perf_tools/analyze_training_perf.py`
 
 - `perf/wait_time_ratio` mean: `0.726` (p95 `0.801`)
 - `perf/step_time` mean: `47.33s`
@@ -51,22 +51,22 @@ Evidence: `truncated_ratio=0.753`, `response_len_median=2048` (hitting cap on mo
 ## Process update (what was implemented)
 
 1. Added reusable perf tooling:
-   - `my_exps/opd-397-32b/perf_tools/analyze_training_perf.py`
-   - `my_exps/opd-397-32b/perf_tools/ray_gpu_snapshot.py`
-   - `my_exps/opd-397-32b/perf_tools/run_perf_report.sh`
+   - `my_exps/opd/perf_tools/analyze_training_perf.py`
+   - `my_exps/opd/perf_tools/ray_gpu_snapshot.py`
+   - `my_exps/opd/perf_tools/run_perf_report.sh`
 
 2. Upgraded monitor:
-   - `my_exps/opd-397-32b/monitor_privileged_training.sh`
+   - `my_exps/opd/monitor_privileged_training.sh`
    - periodic perf summaries + threshold alerts (`wait_ratio`, rollout TPS, teacher p95)
    - periodic GPU/logical usage snapshots
 
 3. Reward plugin optimization for next run:
-   - `my_exps/opd-397-32b/opd_topk_reward_plugin.py`
+   - `my_exps/opd/opd_topk_reward_plugin.py`
    - switched from per-request `aiohttp.ClientSession()` to pooled persistent session
    - added configurable timeout/connection pool knobs
 
 4. Distill config env wiring for reward HTTP tuning:
-   - `my_exps/opd-397-32b/train_student_async_distill_lib.sh`
+   - `my_exps/opd/train_student_async_distill_lib.sh`
    - new vars: `OPD_RM_CONNECT_TIMEOUT_S`, `OPD_RM_READ_TIMEOUT_S`, `OPD_RM_TOTAL_TIMEOUT_S`,
      `OPD_RM_MAX_CONNECTIONS`, `OPD_RM_MAX_CONNECTIONS_PER_HOST`
 
@@ -78,5 +78,5 @@ Evidence: `truncated_ratio=0.753`, `response_len_median=2048` (hitting cap on mo
    - rebalance train/rollout GPU split if rollout remains dominant
 
 2. Use the new report loop:
-   - `bash my_exps/opd-397-32b/perf_tools/run_perf_report.sh`
+   - `bash my_exps/opd/perf_tools/run_perf_report.sh`
    - monitor for trend changes instead of single-point snapshots

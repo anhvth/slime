@@ -23,7 +23,7 @@ from pathlib import Path
 # =============================================================================
 # Hardcoded paths — edit these to match your environment
 # =============================================================================
-TEACHER_PYTHON = Path("/home/anhvth8/projects/slime/my_exps/opd-397-32b/teacher-qwen-35/.venv/bin/python")
+TEACHER_PYTHON = Path("/home/anhvth8/projects/slime/my_exps/opd/teacher-qwen-35/.venv/bin/python")
 FAST_SGLANG_BIN = Path("/home/anhvth8/dotfiles/mybins/fast_sglang")
 MODEL_HOME = Path(os.environ.get("MODEL_HOME", Path.home() / "ckpt/hf_models/Qwen"))
 

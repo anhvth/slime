@@ -11,11 +11,11 @@ Strategy:
   - Save a standard HF checkpoint ready for Megatron conversion and SGLang rollout
 
 Usage:
-  python my_exps/opd-397-32b/convert_qwen3_to_qwen35_vocab.py \
+  python my_exps/opd/convert_qwen3_to_qwen35_vocab.py \
       --src ~/home-trained-model/Stage3_SFT_Epoch3 \
       --out ~/ckpt/hf_models/Qwen/Qwen3-32B-as-Qwen35 \
       --teacher-tokenizer ~/ckpt/hf_models/Qwen/Qwen3.5-397B-A17B-FP8 \
-      --csv my_exps/opd-397-32b/mapping_qwen_35.csv
+      --csv my_exps/opd/mapping_qwen_35.csv
 """
 
 import argparse
@@ -53,7 +53,7 @@ def parse_args():
     p.add_argument(
         "--csv",
         type=str,
-        default="my_exps/opd-397-32b/mapping_qwen_35.csv",
+        default="my_exps/opd/mapping_qwen_35.csv",
         help="CSV mapping file (qwen3_5_idx, qwen3_idx, token_str)",
     )
     p.add_argument(

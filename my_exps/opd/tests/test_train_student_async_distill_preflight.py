@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-LIB_PATH = REPO_ROOT / "my_exps/opd-397-32b/train_student_async_distill_lib.sh"
+LIB_PATH = REPO_ROOT / "my_exps/opd/train_student_async_distill_lib.sh"
 
 
 def _run_bash(command: str) -> subprocess.CompletedProcess[str]:

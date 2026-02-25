@@ -3,7 +3,7 @@ Ray Serve version of launching serve_teacher.sh on each node.
 
 Run with:
 
-bash my_exps/opd-397-32b/sglang/submit_teacher_serve.sh
+bash my_exps/opd/sglang/submit_teacher_serve.sh
 
 
 Client

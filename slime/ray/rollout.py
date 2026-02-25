@@ -3,9 +3,10 @@ import logging
 import multiprocessing
 import os
 import random
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import ray
@@ -37,6 +38,49 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _get_debug_heartbeat_seconds() -> float:
+    raw_val = os.environ.get("SLIME_DEBUG_HEARTBEAT_SECONDS", "10")
+    try:
+        seconds = float(raw_val)
+    except ValueError:
+        logger.warning(
+            "[DEBUG] Invalid SLIME_DEBUG_HEARTBEAT_SECONDS=%r. Falling back to 10.0s.",
+            raw_val,
+        )
+        return 10.0
+    return max(0.0, seconds)
+
+
+def _run_with_debug_heartbeat(stage_name: str, fn: Callable[[], Any], heartbeat_seconds: float | None = None):
+    """Run a potentially blocking function with periodic heartbeat logs."""
+    heartbeat = _get_debug_heartbeat_seconds() if heartbeat_seconds is None else max(0.0, heartbeat_seconds)
+    if heartbeat <= 0:
+        return fn()
+
+    start = time.perf_counter()
+    stop_event = threading.Event()
+    heartbeat_count = 0
+
+    def _heartbeat_loop():
+        nonlocal heartbeat_count
+        while not stop_event.wait(timeout=heartbeat):
+            heartbeat_count += 1
+            logger.info(
+                "[DEBUG] %s still running (elapsed=%.2fs, heartbeat=%s)",
+                stage_name,
+                time.perf_counter() - start,
+                heartbeat_count,
+            )
+
+    heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
+    try:
+        return fn()
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=0.1)
 
 
 @ray.remote
@@ -147,8 +191,29 @@ class RolloutManager:
                 total_engines,
             )
             raise
-        self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
-        _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        logger.info("[DEBUG][rollout %s] Enter save_debug_rollout_data", rollout_id)
+        save_debug_start_time = time.perf_counter()
+        _run_with_debug_heartbeat(
+            stage_name=f"[rollout {rollout_id}] save_debug_rollout_data",
+            fn=lambda: self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False),
+        )
+        logger.info(
+            "[DEBUG][rollout %s] save_debug_rollout_data finished in %.2fs",
+            rollout_id,
+            time.perf_counter() - save_debug_start_time,
+        )
+
+        logger.info("[DEBUG][rollout %s] Enter _log_rollout_data", rollout_id)
+        log_rollout_start_time = time.perf_counter()
+        _run_with_debug_heartbeat(
+            stage_name=f"[rollout {rollout_id}] _log_rollout_data",
+            fn=lambda: _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time),
+        )
+        logger.info(
+            "[DEBUG][rollout %s] _log_rollout_data finished in %.2fs",
+            rollout_id,
+            time.perf_counter() - log_rollout_start_time,
+        )
         self._latest_custom_reward_post_process_metrics = {}
         logger.info(
             "[DEBUG][rollout %s] Begin reward/sample post-process for %s samples",
@@ -856,13 +921,54 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     if args.load_debug_rollout_data:
         return
 
+    stage_start_time = time.perf_counter()
+    logger.info(
+        "[DEBUG][rollout %s] _log_rollout_data start: sample_count=%s, rollout_time=%.2fs",
+        rollout_id,
+        len(samples),
+        rollout_time,
+    )
     log_dict = {**(rollout_extra_metrics or {})}
+
+    metrics_start_time = time.perf_counter()
     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
+    logger.info(
+        "[DEBUG][rollout %s] compute_metrics_from_samples finished in %.2fs",
+        rollout_id,
+        time.perf_counter() - metrics_start_time,
+    )
+
+    perf_metrics_start_time = time.perf_counter()
     log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
+    logger.info(
+        "[DEBUG][rollout %s] compute_perf_metrics_from_samples finished in %.2fs",
+        rollout_id,
+        time.perf_counter() - perf_metrics_start_time,
+    )
+
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
-    logging_utils.log(args, log_dict, step_key="rollout/step")
+    logger.info(
+        "[DEBUG][rollout %s] Enter logging_utils.log (metric_count=%s)",
+        rollout_id,
+        len(log_dict),
+    )
+    tb_log_start_time = time.perf_counter()
+    _run_with_debug_heartbeat(
+        stage_name=f"[rollout {rollout_id}] logging_utils.log",
+        fn=lambda: logging_utils.log(args, log_dict, step_key="rollout/step"),
+    )
+    logger.info(
+        "[DEBUG][rollout %s] logging_utils.log finished in %.2fs",
+        rollout_id,
+        time.perf_counter() - tb_log_start_time,
+    )
+    logger.info(
+        "[DEBUG][rollout %s] _log_rollout_data finished in %.2fs",
+        rollout_id,
+        time.perf_counter() - stage_start_time,
+    )
 
 
 def compute_metrics_from_samples(args, samples):

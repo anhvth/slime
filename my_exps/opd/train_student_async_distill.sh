@@ -288,8 +288,13 @@ DP_SIZE=$((WORLD_SIZE / TENSOR_MODEL_PARALLEL_SIZE))
 
 BASE_PROMPTS_PER_DP="${BASE_PROMPTS_PER_DP:-8}"
 if [[ -z "${ROLLOUT_BATCH_SIZE:-}" ]]; then
-  # Keep rollout-side occupancy high even when training DP is reduced.
-  ROLLOUT_BATCH_SIZE="${DEFAULT_ROLLOUT_BATCH_SIZE:-56}"
+  if [[ ${DEBUG} -eq 1 ]]; then
+    # Debug runs should be cheaper by default: 8 * 4 = global_batch_size 32.
+    ROLLOUT_BATCH_SIZE="${DEBUG_ROLLOUT_BATCH_SIZE:-8}"
+  else
+    # Keep rollout-side occupancy high even when training DP is reduced.
+    ROLLOUT_BATCH_SIZE="${DEFAULT_ROLLOUT_BATCH_SIZE:-56}"
+  fi
 fi
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
 if [[ -z "${GLOBAL_BATCH_SIZE:-}" ]]; then
@@ -337,7 +342,7 @@ fi
 validate_rollout_lengths
 echo "Rollout length limits: context=${ROLLOUT_MAX_CONTEXT_LEN}, prompt<=${ROLLOUT_MAX_PROMPT_LEN}, response<=${ROLLOUT_MAX_RESPONSE_LEN}"
 
-LR="${LR:-5e-7}"
+LR="${LR:-5e-6}"
 LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-20}"
 CLIP_GRAD="${CLIP_GRAD:-0.5}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-12288}"
@@ -460,7 +465,7 @@ ray job submit --address="${RAY_JOB_ADDRESS}" \
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}" \
   --rollout-top-p "${ROLLOUT_TOP_P}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE}" \
-  --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-5}" \
+  --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL:-1}" \
   --balance-data \
   --optimizer adam \
   --lr "${LR}" \

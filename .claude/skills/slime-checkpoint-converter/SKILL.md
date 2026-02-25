@@ -29,8 +29,8 @@ PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py \
 source scripts/models/qwen3-32B-as-qwen35.sh
 
 PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py \
-    --input-dir outputs/opd-397-32b/student_async/iter_0000699 \
-    --output-dir outputs/opd-397-32b/student_async_hf/iter_0000699 \
+    --input-dir outputs/opd/student_async/iter_0000699 \
+    --output-dir outputs/opd/student_async_hf/iter_0000699 \
     --origin-hf-dir $HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned/ \
     --vocab-size 248320
 ```

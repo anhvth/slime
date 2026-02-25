@@ -1,7 +1,7 @@
 # OPD Training Bottleneck Analysis Report
 
 **Date:** 2026-02-21  
-**Training Script:** `my_exps/opd-397-32b/train_student.sh`  
+**Training Script:** `my_exps/opd/train_student.sh`  
 **WandB Run:** https://wandb.ai/anhvth/slime-opd/runs/zssfduek
 
 ---

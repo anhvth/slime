@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Any
 
@@ -562,7 +563,22 @@ def _extract_input_token_logprob_rows(
 
 
 def _to_canonical_pieces(tokenizer, token_ids: list[int]) -> list[str]:
-    pieces: list[str] = []
+    if not token_ids:
+        return []
+
+    # Fast path: decode each token individually and verify concatenation.
+    # For Qwen3/GLM byte-level BPE tokenizers this almost always succeeds
+    # and is O(n) instead of the O(n²) prefix-decode fallback.
+    pieces = [
+        tokenizer.decode([tid], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        for tid in token_ids
+    ]
+    full_text = tokenizer.decode(token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    if "".join(pieces) == full_text:
+        return pieces
+
+    # Slow fallback: incremental prefix decoding (original O(n²) approach).
+    pieces = []
     prev = ""
     for idx in range(len(token_ids)):
         cur = tokenizer.decode(token_ids[: idx + 1], skip_special_tokens=False, clean_up_tokenization_spaces=False)
@@ -731,6 +747,12 @@ def _build_cross_tokenizer_teacher_targets(
     student_tokenizer = _get_tokenizer(_get_student_tokenizer_path(args))
     teacher_tokenizer = _get_tokenizer(_get_teacher_tokenizer_path(args))
 
+    # Pre-built teacher→student token ID map (cached, one-time cost).
+    teacher_to_student = _build_teacher_to_student_token_map(
+        _get_teacher_tokenizer_path(args),
+        _get_student_tokenizer_path(args),
+    )
+
     s_groups, t_groups, clean = _build_alignment_groups(
         student_tokenizer,
         teacher_tokenizer,
@@ -784,19 +806,9 @@ def _build_cross_tokenizer_teacher_targets(
         row_entries = teacher_top_rows[t_anchor]
         merged_by_student_id: dict[int, float] = {}
         for logprob, token_id, token_text in row_entries:
-            token_surface = token_text
-            if token_surface is None:
-                token_surface = teacher_tokenizer.decode(
-                    [int(token_id)],
-                    skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
-                )
-
-            student_ids = student_tokenizer.encode(token_surface, add_special_tokens=False)
-            if len(student_ids) != 1:
+            sid = teacher_to_student.get(int(token_id))
+            if sid is None:
                 continue
-
-            sid = int(student_ids[0])
             merged_logprob = float(logprob) + continuation_logprob
             prev = merged_by_student_id.get(sid)
             if prev is None:
@@ -841,25 +853,38 @@ def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
     progress_interval = int(getattr(args, "opd_postprocess_progress_interval", 0) or 0)
     if progress_interval <= 0:
         progress_interval = max(1, sample_count // 10)
+
+    # Pre-warm cached resources so threads don't race on first init.
+    if cross_tokenizer:
+        _build_teacher_to_student_token_map(
+            _get_teacher_tokenizer_path(args),
+            _get_student_tokenizer_path(args),
+        )
+        _get_tokenizer(_get_student_tokenizer_path(args))
+        _get_tokenizer(_get_teacher_tokenizer_path(args))
+
+    max_workers = _get_int_option(args, "opd_alignment_workers", 8)
     logger.info(
         (
             "[DEBUG][opd_topk] Begin reward post-process: sample_count=%s, topk=%s, "
-            "cross_tokenizer=%s, progress_interval=%s"
+            "cross_tokenizer=%s, max_workers=%s"
         ),
         sample_count,
         topk,
         int(cross_tokenizer),
-        progress_interval,
+        max_workers,
     )
     alignment_total_times: list[float] = []
     alignment_build_groups_times: list[float] = []
     alignment_project_support_times: list[float] = []
     alignment_fallback_flags: list[float] = []
 
-    for i, (sample, reward, response_length) in enumerate(
-        zip(samples, raw_rewards, response_lengths, strict=False),
-        start=1,
-    ):
+    def _process_one_sample(idx: int):
+        """Process a single sample (thread-safe: only reads sample/reward, returns results)."""
+        sample = samples[idx]
+        reward = raw_rewards[idx]
+        response_length = response_lengths[idx]
+
         if cross_tokenizer:
             if not isinstance(reward, dict):
                 raise ValueError(f"reward payload must be a dict in cross-tokenizer mode, got {type(reward)}.")
@@ -876,23 +901,41 @@ def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
                     "Cross-tokenizer top-k length mismatch: "
                     f"len(topk_logprobs)={len(topk_logprobs)} vs response_length={response_length}."
                 )
-            alignment_total_times.append(float(timing_stats.get("total_time_s", 0.0)))
-            alignment_build_groups_times.append(float(timing_stats.get("build_alignment_groups_time_s", 0.0)))
-            alignment_project_support_times.append(float(timing_stats.get("project_teacher_support_time_s", 0.0)))
-            alignment_fallback_flags.append(float(timing_stats.get("fallback_used", 0.0)))
-            sample.teacher_topk_group_lengths = group_lengths
-            sample.teacher_topk_group_valid_mask = group_valid_mask
+            return topk_logprobs, topk_token_ids, group_lengths, group_valid_mask, timing_stats
         else:
             topk_logprobs, topk_token_ids = extract_topk_from_reward(
                 reward,
                 response_length=response_length,
                 topk=topk,
             )
-            sample.teacher_topk_group_lengths = None
-            sample.teacher_topk_group_valid_mask = None
+            return topk_logprobs, topk_token_ids, None, None, None
+
+    # --- Run processing in parallel threads ---
+    if max_workers > 1 and sample_count > 1:
+        with ThreadPoolExecutor(max_workers=min(max_workers, sample_count)) as executor:
+            results = list(executor.map(_process_one_sample, range(sample_count)))
+    else:
+        results = [_process_one_sample(idx) for idx in range(sample_count)]
+
+    # --- Assign results back to samples (single-threaded) ---
+    for idx, (topk_logprobs, topk_token_ids, group_lengths, group_valid_mask, timing_stats) in enumerate(results):
+        sample = samples[idx]
+        reward = raw_rewards[idx]
+        response_length = response_lengths[idx]
 
         sample.teacher_topk_logprobs = topk_logprobs
         sample.teacher_topk_token_ids = topk_token_ids
+        if cross_tokenizer:
+            sample.teacher_topk_group_lengths = group_lengths
+            sample.teacher_topk_group_valid_mask = group_valid_mask
+            alignment_total_times.append(float(timing_stats.get("total_time_s", 0.0)))
+            alignment_build_groups_times.append(float(timing_stats.get("build_alignment_groups_time_s", 0.0)))
+            alignment_project_support_times.append(float(timing_stats.get("project_teacher_support_time_s", 0.0)))
+            alignment_fallback_flags.append(float(timing_stats.get("fallback_used", 0.0)))
+        else:
+            sample.teacher_topk_group_lengths = None
+            sample.teacher_topk_group_valid_mask = None
+
         if isinstance(reward, dict):
             teacher_input_ids = reward.get("_opd_teacher_input_ids")
             if isinstance(teacher_input_ids, list):
@@ -902,20 +945,7 @@ def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
                 sample.teacher_logprob_start_len = int(teacher_logprob_start_len)
             teacher_score_logprob_start_len = reward.get("_opd_teacher_score_logprob_start_len")
             if teacher_score_logprob_start_len is not None:
-                # Optional diagnostic field; Sample may not have a declared attribute in older versions.
                 setattr(sample, "teacher_score_logprob_start_len", int(teacher_score_logprob_start_len))
-
-        if i % progress_interval == 0 or i == sample_count:
-            elapsed_s = time.perf_counter() - stage_start_time
-            avg_s = elapsed_s / i if i > 0 else 0.0
-            logger.info(
-                "[DEBUG][opd_topk] reward post-process progress: %s/%s (%.1f%%), elapsed=%.2fs, avg=%.4fs/sample",
-                i,
-                sample_count,
-                100.0 * i / max(sample_count, 1),
-                elapsed_s,
-                avg_s,
-            )
 
     metrics_dict: dict[str, float] = {}
     if cross_tokenizer:
