@@ -223,6 +223,8 @@ class MegatronTrainRayActor(TrainRayActor):
             "teacher_log_probs": torch.float32,
             "teacher_topk_logprobs": torch.float32,
             "teacher_topk_token_ids": torch.long,
+            "teacher_topk_group_lengths": torch.long,
+            "teacher_topk_group_valid_mask": torch.long,
         }
         for key, dtype in tensor_rollout_keys.items():
             if key not in rollout_data:

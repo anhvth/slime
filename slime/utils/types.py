@@ -31,6 +31,13 @@ class Sample:
     teacher_logprob_start_len: int | None = None  # Teacher-side logprob_start_len used for response slicing
     teacher_topk_logprobs: list[list[float]] | None = None  # Teacher top-k logprobs for top-k distillation
     teacher_topk_token_ids: list[list[int]] | None = None  # Teacher top-k token ids for top-k distillation
+    # Per-response-position group metadata for cross-tokenizer top-k distillation.
+    # At each group anchor index, group_lengths[idx] stores the span length (>0).
+    # Non-anchor positions store 0.
+    teacher_topk_group_lengths: list[int] | None = None
+    # Validity mask aligned with group anchors; 1 means teacher/student support is usable for loss.
+    # Non-anchor positions store 0.
+    teacher_topk_group_valid_mask: list[int] | None = None
 
     class Status(Enum):
         PENDING = "pending"

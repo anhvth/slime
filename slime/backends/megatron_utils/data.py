@@ -423,6 +423,8 @@ def log_rollout_data(
                 "teacher_logprob_start_len",
                 "teacher_topk_logprobs",
                 "teacher_topk_token_ids",
+                "teacher_topk_group_lengths",
+                "teacher_topk_group_valid_mask",
             ]:
                 continue
             # Upload per sample mean for each rollout value

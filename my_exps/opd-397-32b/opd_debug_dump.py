@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover - fallback for non-megatron unit tests
 logger = logging.getLogger(__name__)
 
 DEBUG_DUMP_SCHEMA_VERSION = 1
+_MAX_SAMPLES_PER_UPDATE_HARD_CAP = 8
 _SEEN_UPDATE_KEYS: set[str] = set()
 
 
@@ -140,7 +141,14 @@ def _retention_limits(args: Namespace) -> tuple[int, int]:
 
 
 def _sampling_limits(args: Namespace) -> tuple[int, int]:
-    max_samples = max(1, _safe_int(getattr(args, "opd_debug_dump_max_samples_per_update", 8), 8))
+    requested_samples = max(
+        1,
+        _safe_int(
+            getattr(args, "opd_debug_dump_max_samples_per_update", _MAX_SAMPLES_PER_UPDATE_HARD_CAP),
+            _MAX_SAMPLES_PER_UPDATE_HARD_CAP,
+        ),
+    )
+    max_samples = min(requested_samples, _MAX_SAMPLES_PER_UPDATE_HARD_CAP)
     # 0 means "log all response positions" for each kept sample.
     max_positions = max(0, _safe_int(getattr(args, "opd_debug_dump_max_positions_per_sample", 0), 0))
     return max_samples, max_positions
@@ -241,13 +249,27 @@ def _enforce_retention(dump_dir: Path, max_total_bytes: int, max_files: int) -> 
             files.pop(0)
 
 
-def _build_recipe(args: Namespace, mode: str) -> dict[str, float | str]:
+def _build_recipe(args: Namespace, mode: str) -> dict[str, Any]:
+    student_path = str(getattr(args, "opd_student_tokenizer_path", "") or "")
+    teacher_path = str(getattr(args, "opd_teacher_tokenizer_path", "") or "")
+    hf_checkpoint = str(getattr(args, "hf_checkpoint", "") or "")
+    student_effective = student_path or hf_checkpoint
+    teacher_effective = teacher_path or student_effective
+
     return {
         "distill_loss_mode": mode,
         "opd_distill_coef": _safe_float(getattr(args, "opd_distill_coef", 1.0), 1.0),
         "opd_mixed_kl_weight": _safe_float(getattr(args, "opd_mixed_kl_weight", 0.5), 0.5),
         "opd_jsd_beta": _safe_float(getattr(args, "opd_jsd_beta", 0.5), 0.5),
         "opd_kl_coef": _safe_float(getattr(args, "opd_kl_coef", 1.0), 1.0),
+        "opd_cross_tokenizer_enable": int(
+            _normalize_bool(getattr(args, "opd_cross_tokenizer_enable", False), default=False)
+        ),
+        "opd_teacher_tokenizer_path": teacher_path,
+        "opd_student_tokenizer_path": student_path,
+        "opd_teacher_tokenizer_path_effective": teacher_effective,
+        "opd_student_tokenizer_path_effective": student_effective,
+        "hf_checkpoint": hf_checkpoint,
     }
 
 
@@ -294,6 +316,32 @@ def _teacher_view(
     return teacher_ids, teacher_start
 
 
+def _sample_topk_positions(
+    *,
+    response_length: int,
+    max_positions: int,
+    rng: random.Random,
+    cross_tokenizer: bool,
+    group_lengths: torch.Tensor | None,
+) -> tuple[torch.Tensor, str]:
+    if not cross_tokenizer:
+        return _to_position_index_tensor(response_length, max_positions, rng), "student_token"
+
+    if group_lengths is None or group_lengths.numel() != response_length:
+        return _to_position_index_tensor(response_length, max_positions, rng), "student_token"
+
+    anchor_indices = torch.nonzero(group_lengths > 0, as_tuple=False).reshape(-1).to(dtype=torch.long)
+    if anchor_indices.numel() == 0:
+        return _to_position_index_tensor(response_length, max_positions, rng), "student_token"
+
+    if max_positions <= 0 or int(anchor_indices.numel()) <= max_positions:
+        return anchor_indices, "teacher_group_anchor"
+
+    selected = rng.sample(anchor_indices.tolist(), k=max_positions)
+    selected.sort()
+    return torch.tensor(selected, dtype=torch.long), "teacher_group_anchor"
+
+
 def dump_topk_debug_update(
     args: Namespace,
     *,
@@ -319,7 +367,21 @@ def dump_topk_debug_update(
         student_input_ids = _to_long_cpu_tensor(raw["student_input_ids"])
         response_length = _safe_int(raw["response_length"], 0)
         response_start = _safe_int(raw["response_start"], 0)
-        position_indices = _to_position_index_tensor(response_length, max_positions, rng)
+        cross_tokenizer = _normalize_bool(raw.get("cross_tokenizer", False), default=False)
+        group_lengths_full = None
+        group_valid_mask_full = None
+        if raw.get("teacher_topk_group_lengths") is not None:
+            group_lengths_full = _to_long_cpu_tensor(raw["teacher_topk_group_lengths"])
+        if raw.get("teacher_topk_group_valid_mask") is not None:
+            group_valid_mask_full = _to_long_cpu_tensor(raw["teacher_topk_group_valid_mask"])
+
+        position_indices, position_unit = _sample_topk_positions(
+            response_length=response_length,
+            max_positions=max_positions,
+            rng=rng,
+            cross_tokenizer=cross_tokenizer,
+            group_lengths=group_lengths_full,
+        )
 
         teacher_ids, teacher_start = _teacher_view(
             student_input_ids=student_input_ids,
@@ -335,26 +397,38 @@ def dump_topk_debug_update(
         reverse_kl = _to_float_cpu_tensor(raw["reverse_kl"]).index_select(0, position_indices)
         jsd = raw.get("jsd")
         jsd_tensor = None if jsd is None else _to_float_cpu_tensor(jsd).index_select(0, position_indices)
-
-        sampled_records.append(
-            {
-                "sample_index": _safe_int(raw.get("sample_index"), -1),
-                "microbatch_sample_index": _safe_int(raw.get("microbatch_sample_index"), idx),
-                "student_input_ids": student_input_ids,
-                "response_start": response_start,
-                "response_length": response_length,
-                "response_token_ids": student_input_ids[response_start : response_start + response_length],
-                "position_indices": position_indices,
-                "teacher_input_ids": teacher_ids,
-                "teacher_logprob_start_len": teacher_start,
-                "teacher_topk_logprobs": teacher_topk_logprobs,
-                "teacher_topk_token_ids": teacher_topk_token_ids,
-                "student_topk_logprobs": student_topk_logprobs,
-                "forward_kl": forward_kl,
-                "reverse_kl": reverse_kl,
-                "jsd": jsd_tensor,
-            }
+        group_lengths = (
+            None if group_lengths_full is None else group_lengths_full.index_select(0, position_indices)
         )
+        group_valid_mask = (
+            None if group_valid_mask_full is None else group_valid_mask_full.index_select(0, position_indices)
+        )
+
+        sampled_record = {
+            "sample_index": _safe_int(raw.get("sample_index"), -1),
+            "microbatch_sample_index": _safe_int(raw.get("microbatch_sample_index"), idx),
+            "student_input_ids": student_input_ids,
+            "response_start": response_start,
+            "response_length": response_length,
+            "response_token_ids": student_input_ids[response_start : response_start + response_length],
+            "position_indices": position_indices,
+            "position_unit": position_unit,
+            "cross_tokenizer": int(cross_tokenizer),
+            "teacher_input_ids": teacher_ids,
+            "teacher_logprob_start_len": teacher_start,
+            "teacher_topk_logprobs": teacher_topk_logprobs,
+            "teacher_topk_token_ids": teacher_topk_token_ids,
+            "student_topk_logprobs": student_topk_logprobs,
+            "forward_kl": forward_kl,
+            "reverse_kl": reverse_kl,
+            "jsd": jsd_tensor,
+        }
+        if group_lengths is not None:
+            sampled_record["teacher_topk_group_lengths"] = group_lengths
+        if group_valid_mask is not None:
+            sampled_record["teacher_topk_group_valid_mask"] = group_valid_mask
+
+        sampled_records.append(sampled_record)
 
     payload = {
         "version": DEBUG_DUMP_SCHEMA_VERSION,

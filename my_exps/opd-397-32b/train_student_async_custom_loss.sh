@@ -79,7 +79,46 @@ next_run_name() {
   echo "run_$((max_idx + 1))"
 }
 
-export RESUME_MODEL_ROOT="${RESUME_MODEL_ROOT:-$HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned}"
+normalize_bool_01() {
+  local raw="${1:-0}"
+  raw="$(echo "${raw}" | tr '[:upper:]' '[:lower:]')"
+  case "${raw}" in
+    1|true|t|yes|y|on) echo "1" ;;
+    0|false|f|no|n|off|"") echo "0" ;;
+    *)
+      echo "Boolean flag must be one of: 0/1 true/false yes/no on/off. Got '${1}'" >&2
+      exit 1
+      ;;
+  esac
+}
+
+path_uses_qwen35_converted_vocab() {
+  local path_value="${1:-}"
+  [[ -n "${path_value}" ]] || return 1
+  local lowered="${path_value,,}"
+  [[ "${lowered}" == *"as-qwen35"* ]]
+}
+
+fail_if_cross_tokenizer_uses_qwen35_converted_path() {
+  local label="$1"
+  local path_value="$2"
+  if [[ "${OPD_CROSS_TOKENIZER_ENABLE_NORM}" == "1" ]] && path_uses_qwen35_converted_vocab "${path_value}"; then
+    echo "Invalid cross-tokenizer config: ${label}='${path_value}'" >&2
+    echo "Cross-tokenizer distillation must use native Qwen3 checkpoints (no '*-As-Qwen35*' converted vocab)." >&2
+    echo "Use paths like '$HOME/home-trained-model/Stage3_SFT_Epoch3/' or '$HOME/ckpt/hf_models/Qwen/Qwen3-4B'." >&2
+    exit 1
+  fi
+}
+
+OPD_CROSS_TOKENIZER_ENABLE_NORM="$(normalize_bool_01 "${OPD_CROSS_TOKENIZER_ENABLE:-0}")"
+
+if (( DEBUG_MODE == 1 )); then
+  RESUME_MODEL_ROOT_DEFAULT="${RESUME_MODEL_ROOT_DEBUG:-${RESUME_MODEL_ROOT:-$HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned}}"
+else
+  RESUME_MODEL_ROOT_DEFAULT="${RESUME_MODEL_ROOT_TRAIN:-${RESUME_MODEL_ROOT:-$HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned}}"
+fi
+export RESUME_MODEL_ROOT="${RESUME_MODEL_ROOT:-${RESUME_MODEL_ROOT_DEFAULT}}"
+fail_if_cross_tokenizer_uses_qwen35_converted_path "RESUME_MODEL_ROOT" "${RESUME_MODEL_ROOT}"
 DEFAULT_RESUME_BASENAME="$(basename "${RESUME_MODEL_ROOT%/}")"
 export RESUME_SAVE_TAG="${RESUME_SAVE_TAG:-${DEFAULT_RESUME_BASENAME}}"
 
@@ -90,6 +129,7 @@ if [[ -z "${RESUME_HF_DIR:-}" ]]; then
     export RESUME_HF_DIR="${RESUME_MODEL_ROOT%/}/hf"
   fi
 fi
+fail_if_cross_tokenizer_uses_qwen35_converted_path "RESUME_HF_DIR" "${RESUME_HF_DIR}"
 
 if [[ -z "${RESUME_DIST_DIR:-}" ]]; then
   if [[ -d "${RESUME_MODEL_ROOT%/}/dist" ]]; then
@@ -100,6 +140,7 @@ if [[ -z "${RESUME_DIST_DIR:-}" ]]; then
     export RESUME_DIST_DIR="${RESUME_MODEL_ROOT%/}/dist"
   fi
 fi
+fail_if_cross_tokenizer_uses_qwen35_converted_path "RESUME_DIST_DIR" "${RESUME_DIST_DIR}"
 
 if [[ -n "${CLI_LOSS_MODE}" ]]; then
   export DISTILL_LOSS_MODE="${CLI_LOSS_MODE}"
@@ -132,21 +173,9 @@ else
   RUN_MODE_TAG="train"
 fi
 
-normalize_bool_01() {
-  local raw="${1:-0}"
-  raw="$(echo "${raw}" | tr '[:upper:]' '[:lower:]')"
-  case "${raw}" in
-    1|true|t|yes|y|on) echo "1" ;;
-    0|false|f|no|n|off|"") echo "0" ;;
-    *)
-      echo "OPD_PRIVILEGED_ENABLE must be a boolean value, got '${1}'" >&2
-      exit 1
-      ;;
-  esac
-}
-
 OPD_PRIVILEGED_ENABLE_NORM="$(normalize_bool_01 "${OPD_PRIVILEGED_ENABLE:-0}")"
 export OPD_PRIVILEGED_ENABLE="${OPD_PRIVILEGED_ENABLE_NORM}"
+export OPD_CROSS_TOKENIZER_ENABLE="${OPD_CROSS_TOKENIZER_ENABLE_NORM}"
 if [[ "${OPD_PRIVILEGED_ENABLE_NORM}" == "1" ]]; then
   PRIV_NAME_TAG="privileged"
 else
@@ -171,8 +200,23 @@ fi
 export RUN_NAME
 
 export PROMPT_DATA="${PROMPT_DATA:-${REPO_ROOT}/datasets/200k_prompt_for_distillation.jsonl}"
-export STUDENT_HF_CHECKPOINT="${STUDENT_HF_CHECKPOINT:-${RESUME_HF_DIR}}"
+if (( DEBUG_MODE == 1 )); then
+  STUDENT_HF_NATIVE_DEFAULT="${STUDENT_HF_DEFAULT_DEBUG:-${STUDENT_HF_DEFAULT:-$HOME/ckpt/hf_models/Qwen/Qwen3-4B}}"
+else
+  STUDENT_HF_NATIVE_DEFAULT="${STUDENT_HF_DEFAULT_TRAIN:-${STUDENT_HF_DEFAULT:-$HOME/home-trained-model/Stage3_SFT_Epoch3/}}"
+fi
+if [[ "${OPD_CROSS_TOKENIZER_ENABLE_NORM}" == "1" ]]; then
+  STUDENT_HF_CHECKPOINT_DEFAULT="${STUDENT_HF_NATIVE_DEFAULT}"
+else
+  STUDENT_HF_CHECKPOINT_DEFAULT="${RESUME_HF_DIR}"
+fi
+export STUDENT_HF_CHECKPOINT="${STUDENT_HF_CHECKPOINT:-${STUDENT_HF_CHECKPOINT_DEFAULT}}"
 export STUDENT_REF_LOAD="${STUDENT_REF_LOAD:-${RESUME_DIST_DIR}}"
+fail_if_cross_tokenizer_uses_qwen35_converted_path "STUDENT_HF_CHECKPOINT" "${STUDENT_HF_CHECKPOINT}"
+fail_if_cross_tokenizer_uses_qwen35_converted_path "STUDENT_REF_LOAD" "${STUDENT_REF_LOAD}"
+if [[ "${OPD_CROSS_TOKENIZER_ENABLE_NORM}" == "1" && -z "${OPD_STUDENT_TOKENIZER_PATH:-}" ]]; then
+  export OPD_STUDENT_TOKENIZER_PATH="${STUDENT_HF_CHECKPOINT%/}"
+fi
 if [[ -z "${STUDENT_SAVE:-}" ]]; then
   export STUDENT_SAVE="${RUN_ROOT}/${RUN_NAME}"
 else
@@ -198,6 +242,7 @@ if [[ -z "${STUDENT_LOAD:-}" ]]; then
     export STUDENT_LOAD="${RESUME_DIST_DIR}"
   fi
 fi
+fail_if_cross_tokenizer_uses_qwen35_converted_path "STUDENT_LOAD" "${STUDENT_LOAD}"
 
 echo "[wrapper] DISTILL_LOSS_MODE=${DISTILL_LOSS_MODE}"
 echo "[wrapper] run_name=${RUN_NAME}"

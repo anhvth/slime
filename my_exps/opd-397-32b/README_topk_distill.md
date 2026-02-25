@@ -27,6 +27,8 @@ for top-k modes through `opd_topk_reward_plugin.py`.
   - `my_exps/opd-397-32b/train_student_async_distill_lib.sh`
 - Added privileged JSD wrapper launcher:
   - `my_exps/opd-397-32b/train_student_async_jsd_with_privileged_infomation.sh`
+- Added cross-tokenizer launcher (native Qwen3 student, no vocab conversion):
+  - `my_exps/opd-397-32b/train_student_async_cross_tokenizer.sh`
 
 ## Comparison with existing default OPD
 
@@ -67,6 +69,9 @@ Set these env vars when running `my_exps/opd-397-32b/train_student_async_distill
 - `OPD_PRIVILEGED_OPEN_TAG` (default: `[PRIVILEGED_CONTEXT]`)
 - `OPD_PRIVILEGED_CLOSE_TAG` (default: `[/PRIVILEGED_CONTEXT]`)
 - `OPD_PRIVILEGED_TOKENIZER_PATH` (default: empty; fallback to `--hf-checkpoint`)
+- `OPD_CROSS_TOKENIZER_ENABLE` (default: `0`; when `1`, enable GOLD-style cross-tokenizer grouping for `fkl`/`mixed`/`jsd`)
+- `OPD_TEACHER_TOKENIZER_PATH` (required when cross-tokenizer enabled)
+- `OPD_STUDENT_TOKENIZER_PATH` (default: empty; fallback to `--hf-checkpoint`)
 - `OPD_RM_CONNECT_TIMEOUT_S` (default: `2.0`)
 - `OPD_RM_READ_TIMEOUT_S` (default: `120.0`)
 - `OPD_RM_TOTAL_TIMEOUT_S` (default: `180.0`)
@@ -78,7 +83,7 @@ Set these env vars when running `my_exps/opd-397-32b/train_student_async_distill
 - `OPD_DEBUG_DUMP_MAX_FILES` (default: `20000`)
 - `OPD_DEBUG_DUMP_MAX_FILE_MB` (default: `64`, soft cap)
 - `OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE` (default: `8`)
-- `OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE` (default: `512`)
+- `OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE` (default: `0`, meaning all response positions)
 - `OPD_DEBUG_DUMP_SEED` (default: `${SEED:-1234}`)
 
 Examples:
@@ -101,6 +106,95 @@ DISTILL_LOSS_MODE=jsd OPD_TOP_LOGPROBS_NUM=16 OPD_JSD_BETA=0.5 \
 
 # Privileged top-k JSD wrapper (defaults to jsd + privileged enabled)
 bash my_exps/opd-397-32b/train_student_async_jsd_with_privileged_infomation.sh
+
+# Cross-tokenizer top-k distillation (Qwen3.5 teacher -> native Qwen3 student)
+bash my_exps/opd-397-32b/train_student_async_cross_tokenizer.sh --loss jsd
+```
+
+## Cross-tokenizer (no vocab conversion)
+
+Use this launcher to distill from a Qwen3.5 teacher into native Qwen3 checkpoints without `*-as-qwen35` conversion:
+
+```bash
+# 32B default student:
+#   ~/home-trained-model/Stage3_SFT_Epoch3/
+# 4B debug student:
+#   ~/ckpt/hf_models/Qwen/Qwen3-4B
+bash my_exps/opd-397-32b/train_student_async_cross_tokenizer.sh --loss fkl
+```
+
+Defaults set by this launcher:
+
+- `OPD_CROSS_TOKENIZER_ENABLE=1`
+- `OPD_TEACHER_TOKENIZER_PATH=~/ckpt/hf_models/Qwen/Qwen3.5-397B-A17B-FP8`
+- `MODEL_CONFIG_REL_DEBUG=scripts/models/qwen3-4B.sh`
+- `MODEL_CONFIG_REL_TRAIN=scripts/models/qwen3-32B.sh`
+- `STUDENT_HF_DEFAULT_DEBUG=~/ckpt/hf_models/Qwen/Qwen3-4B`
+- `STUDENT_HF_DEFAULT_TRAIN=~/home-trained-model/Stage3_SFT_Epoch3/`
+- `RESUME_MODEL_ROOT_DEBUG=~/ckpt/hf_models/Qwen/Qwen3-4B`
+- `RESUME_MODEL_ROOT_TRAIN=~/home-trained-model/Stage3_SFT_Epoch3/`
+
+This avoids `*-As-Qwen35*` resume tags when you are training native Qwen3 cross-tokenizer runs.
+
+Cross-mode launcher/tokenizer precedence now is:
+
+1. `STUDENT_HF_CHECKPOINT` (explicit env override) if provided.
+2. In cross mode (`OPD_CROSS_TOKENIZER_ENABLE=1`): native defaults
+   `STUDENT_HF_DEFAULT_DEBUG` / `STUDENT_HF_DEFAULT_TRAIN`.
+3. Non-cross fallback: `RESUME_HF_DIR`.
+
+In cross mode, when `OPD_STUDENT_TOKENIZER_PATH` is empty, it is auto-set to the resolved
+`STUDENT_HF_CHECKPOINT_PATH` before custom config generation.
+
+Strict preflight in `train_student_async_distill.sh` now aborts before Ray submit when:
+
+- `MODEL_ARGS --vocab-size` (from `MODEL_CONFIG_REL_*`) does not match
+  `${STUDENT_HF_CHECKPOINT_PATH}/config.json:vocab_size`.
+
+Mismatch error prints both detected values and the exact env/model-config knobs to fix.
+
+## Live viewer tokenizer resolution (legacy dumps)
+
+`debug_dump_live_server_v2.py` now uses dump recipe effective fields first:
+
+- `opd_student_tokenizer_path_effective`
+- `opd_teacher_tokenizer_path_effective`
+- `hf_checkpoint`
+
+For legacy dumps without these fields, it backfills by token-id capacity:
+
+- student side requires capacity for max id seen in
+  `student_input_ids` and `teacher_topk_token_ids`
+- teacher side requires capacity for max id seen in `teacher_input_ids`
+
+Tokenizers whose `len(tokenizer)` cannot represent those ids are rejected automatically.
+The UI summary shows required max ids, selected tokenizer capacities, and warnings when
+capacity fallback was needed.
+
+Manual override examples:
+
+```bash
+python my_exps/opd-397-32b/debug_dump_live_server_v2.py \
+  --runs-root outputs/opd-397-32b \
+  --student-tokenizer-path ~/ckpt/hf_models/Qwen/Qwen3-4B-As-Qwen35 \
+  --teacher-tokenizer-path ~/ckpt/hf_models/Qwen/Qwen3.5-397B-A17B-FP8
+```
+
+## Terminal dump inspector
+
+Use this CLI tool to inspect a single `distill_debug_*.pt` directly in terminal:
+
+```bash
+python my_exps/opd-397-32b/debug_terminal.py /path/to/distill_debug_*.pt
+```
+
+Optional overrides:
+
+```bash
+python my_exps/opd-397-32b/debug_terminal.py /path/to/distill_debug_*.pt \
+  --sample 0 \
+  --student-tokenizer-path ~/ckpt/hf_models/Qwen/Qwen3-4B \
+  --teacher-tokenizer-path ~/ckpt/hf_models/Qwen/Qwen3.5-397B-A17B-FP8
 ```
 
 ## Resume from iter checkpoint with privileged 50k dataset
@@ -169,9 +263,10 @@ Resolution order in plugin:
 ## Current limitations (v1)
 
 - Requires `CONTEXT_PARALLEL_SIZE=1` for `fkl`/`mixed`/`jsd`.
+- Cross-tokenizer support is only implemented for `fkl`/`mixed`/`jsd` (not `rkl`).
 - Teacher API contract assumes SGLang `input_top_logprobs` row entries like:
   - `[float_logprob, int_token_id, text_or_none]`
-- Uses teacher top-k from `input_top_logprobs` only (ignores output-side top-logprobs).
+- Cross-tokenizer mode also requires `meta_info.input_token_logprobs` for continuation-chain merging.
 - JSD mode is top-k renormalized approximation, not exact full-vocab JSD.
 
 ## Metrics
@@ -184,6 +279,9 @@ The custom loss logs:
 - `train/distill_jsd`
 - `train/distill_mode` (`1=fkl`, `2=mixed`, `3=jsd`)
 - `train/distill_topk`
+- `train/distill_valid_groups`
+- `train/distill_skipped_groups`
+- `train/distill_support_coverage`
 
 ## Performance debugging runbook
 

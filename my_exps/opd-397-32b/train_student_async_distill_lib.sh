@@ -40,6 +40,96 @@ require_positive_int() {
   }
 }
 
+extract_model_arg_value() {
+  local key="$1"
+  local args_name="${2:-MODEL_ARGS}"
+  local -n args_ref="${args_name}"
+  local idx
+  local arg=""
+
+  for ((idx = 0; idx < ${#args_ref[@]}; idx++)); do
+    arg="${args_ref[idx]}"
+    if [[ "${arg}" == "${key}" ]]; then
+      if (( idx + 1 < ${#args_ref[@]} )); then
+        printf '%s\n' "${args_ref[idx + 1]}"
+        return 0
+      fi
+      return 1
+    fi
+    if [[ "${arg}" == "${key}="* ]]; then
+      printf '%s\n' "${arg#*=}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+read_hf_config_vocab_size() {
+  local hf_checkpoint_path="$1"
+  local config_path="${hf_checkpoint_path%/}/config.json"
+  [[ -f "${config_path}" ]] || return 1
+
+  python3 - "${config_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+try:
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    value = int(data.get("vocab_size"))
+except Exception:
+    raise SystemExit(1)
+
+if value <= 0:
+    raise SystemExit(1)
+
+print(value)
+PY
+}
+
+preflight_cross_tokenizer_vocab_match() {
+  local cross_enabled="$1"
+  local model_config_rel="$2"
+  local hf_checkpoint_path="$3"
+  local args_name="${4:-MODEL_ARGS}"
+  local model_vocab=""
+  local hf_vocab=""
+
+  [[ "${cross_enabled}" == "1" ]] || return 0
+
+  if ! model_vocab="$(extract_model_arg_value "--vocab-size" "${args_name}")"; then
+    echo "Cross-tokenizer preflight failed: MODEL_ARGS from '${model_config_rel}' is missing --vocab-size." >&2
+    echo "Set MODEL_CONFIG_REL_{DEBUG,TRAIN} to the correct native-student model config." >&2
+    exit 1
+  fi
+  if ! [[ "${model_vocab}" =~ ^[0-9]+$ ]]; then
+    echo "Cross-tokenizer preflight failed: invalid --vocab-size value in MODEL_ARGS: '${model_vocab}'." >&2
+    echo "model_config_rel=${model_config_rel}" >&2
+    exit 1
+  fi
+
+  if ! hf_vocab="$(read_hf_config_vocab_size "${hf_checkpoint_path}")"; then
+    echo "Cross-tokenizer preflight failed: unable to read positive integer vocab_size from" >&2
+    echo "  ${hf_checkpoint_path%/}/config.json" >&2
+    exit 1
+  fi
+
+  if [[ "${model_vocab}" != "${hf_vocab}" ]]; then
+    echo "Cross-tokenizer preflight failed: student model/config vocab mismatch." >&2
+    echo "  model_config_rel: ${model_config_rel}" >&2
+    echo "  hf_checkpoint: ${hf_checkpoint_path}" >&2
+    echo "  model_args --vocab-size: ${model_vocab}" >&2
+    echo "  hf config vocab_size: ${hf_vocab}" >&2
+    echo "Fix one of:" >&2
+    echo "  - Set STUDENT_HF_CHECKPOINT to a checkpoint matching --vocab-size=${model_vocab}" >&2
+    echo "  - Set MODEL_CONFIG_REL_{DEBUG,TRAIN} to a config matching vocab_size=${hf_vocab}" >&2
+    echo "  - Disable cross mode (OPD_CROSS_TOKENIZER_ENABLE=0) if this run should not be cross-tokenizer" >&2
+    exit 1
+  fi
+}
+
 require_float_range() {
   local value="$1"
   local name="$2"
@@ -158,6 +248,13 @@ setup_distill_mode() {
   OPD_PRIVILEGED_METADATA_KEY="${OPD_PRIVILEGED_METADATA_KEY:-privileged_context}"
   OPD_PRIVILEGED_FALLBACK_LABEL="$(normalize_bool_flag "${OPD_PRIVILEGED_FALLBACK_LABEL:-1}" "OPD_PRIVILEGED_FALLBACK_LABEL")"
   OPD_PRIVILEGED_TOKENIZER_PATH="${OPD_PRIVILEGED_TOKENIZER_PATH:-}"
+  OPD_CROSS_TOKENIZER_ENABLE="$(normalize_bool_flag "${OPD_CROSS_TOKENIZER_ENABLE:-0}" "OPD_CROSS_TOKENIZER_ENABLE")"
+  OPD_TEACHER_TOKENIZER_PATH="${OPD_TEACHER_TOKENIZER_PATH:-}"
+  OPD_STUDENT_TOKENIZER_PATH="${OPD_STUDENT_TOKENIZER_PATH:-}"
+  if [[ "${OPD_CROSS_TOKENIZER_ENABLE}" == "1" && -z "${OPD_TEACHER_TOKENIZER_PATH}" ]]; then
+    echo "OPD_TEACHER_TOKENIZER_PATH is required when OPD_CROSS_TOKENIZER_ENABLE=1." >&2
+    exit 1
+  fi
 
   OPD_RM_CONNECT_TIMEOUT_S="${OPD_RM_CONNECT_TIMEOUT_S:-2.0}"
   OPD_RM_READ_TIMEOUT_S="${OPD_RM_READ_TIMEOUT_S:-120.0}"
@@ -182,13 +279,13 @@ setup_distill_mode() {
   OPD_DEBUG_DUMP_MAX_FILES="${OPD_DEBUG_DUMP_MAX_FILES:-20000}"
   OPD_DEBUG_DUMP_MAX_FILE_MB="${OPD_DEBUG_DUMP_MAX_FILE_MB:-64}"
   OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE="${OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE:-8}"
-  OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE="${OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE:-512}"
+  OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE="${OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE:-0}"
   OPD_DEBUG_DUMP_SEED="${OPD_DEBUG_DUMP_SEED:-${SEED:-1234}}"
   require_non_negative_int "${OPD_DEBUG_DUMP_MAX_TOTAL_MB}" "OPD_DEBUG_DUMP_MAX_TOTAL_MB"
   require_positive_int "${OPD_DEBUG_DUMP_MAX_FILES}" "OPD_DEBUG_DUMP_MAX_FILES"
   require_positive_int "${OPD_DEBUG_DUMP_MAX_FILE_MB}" "OPD_DEBUG_DUMP_MAX_FILE_MB"
   require_positive_int "${OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE}" "OPD_DEBUG_DUMP_MAX_SAMPLES_PER_UPDATE"
-  require_positive_int "${OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE}" "OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE"
+  require_non_negative_int "${OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE}" "OPD_DEBUG_DUMP_MAX_POSITIONS_PER_SAMPLE"
   require_non_negative_int "${OPD_DEBUG_DUMP_SEED}" "OPD_DEBUG_DUMP_SEED"
 }
 
@@ -234,6 +331,9 @@ opd_privileged_enable: ${OPD_PRIVILEGED_ENABLE}
 opd_privileged_metadata_key: "$(yaml_escape "${OPD_PRIVILEGED_METADATA_KEY}")"
 opd_privileged_fallback_label: ${OPD_PRIVILEGED_FALLBACK_LABEL}
 opd_privileged_tokenizer_path: "$(yaml_escape "${OPD_PRIVILEGED_TOKENIZER_PATH}")"
+opd_cross_tokenizer_enable: ${OPD_CROSS_TOKENIZER_ENABLE}
+opd_teacher_tokenizer_path: "$(yaml_escape "${OPD_TEACHER_TOKENIZER_PATH}")"
+opd_student_tokenizer_path: "$(yaml_escape "${OPD_STUDENT_TOKENIZER_PATH}")"
 opd_rm_connect_timeout_s: ${OPD_RM_CONNECT_TIMEOUT_S}
 opd_rm_read_timeout_s: ${OPD_RM_READ_TIMEOUT_S}
 opd_rm_total_timeout_s: ${OPD_RM_TOTAL_TIMEOUT_S}

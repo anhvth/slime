@@ -35,6 +35,13 @@ require_dir() {
   }
 }
 
+path_uses_qwen35_converted_vocab() {
+  local path_value="${1:-}"
+  [[ -n "${path_value}" ]] || return 1
+  local lowered="${path_value,,}"
+  [[ "${lowered}" == *"as-qwen35"* ]]
+}
+
 validate_hf_checkpoint_dir() {
   local hf_dir="$1"
   require_dir "${hf_dir}" "Missing student HF checkpoint directory"
@@ -122,15 +129,15 @@ echo "===== $(date '+%Y-%m-%d %H:%M:%S') train_student_async_distill start =====
 
 export PYTHONBUFFERED=1
 if [[ ${DEBUG} -eq 1 ]]; then
-  MODEL_CONFIG_REL="scripts/models/qwen3-4B-as-qwen35.sh"
-  STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT:-/home/anhvth8/ckpt/hf_models/Qwen/Qwen3-4B-As-Qwen35}"
+  MODEL_CONFIG_REL="${MODEL_CONFIG_REL_DEBUG:-${MODEL_CONFIG_REL:-scripts/models/qwen3-4B-as-qwen35.sh}}"
+  STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT_DEBUG:-${STUDENT_HF_DEFAULT:-/home/anhvth8/ckpt/hf_models/Qwen/Qwen3-4B-As-Qwen35}}"
   # Force debug-model paths; override any wrapper-supplied 32B paths
   STUDENT_HF_CHECKPOINT="${STUDENT_HF_DEFAULT}"
   unset STUDENT_REF_LOAD
   unset STUDENT_LOAD
 else
-  MODEL_CONFIG_REL="scripts/models/qwen3-32B-as-qwen35.sh"
-  STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT:-$HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned/}"
+  MODEL_CONFIG_REL="${MODEL_CONFIG_REL_TRAIN:-${MODEL_CONFIG_REL:-scripts/models/qwen3-32B-as-qwen35.sh}}"
+  STUDENT_HF_DEFAULT="${STUDENT_HF_DEFAULT_TRAIN:-${STUDENT_HF_DEFAULT:-$HOME/home-trained-model/Stage3_SFT_Epoch3-As-Qwen35-Aligned/}}"
 fi
 MODEL_CONFIG_SCRIPT="${REPO_ROOT}/${MODEL_CONFIG_REL}"
 require_file "${MODEL_CONFIG_SCRIPT}" "Missing model config script"
@@ -162,7 +169,37 @@ if ! [[ -s "${PROMPT_DATA_PATH}" ]]; then
   exit 1
 fi
 
+OPD_CROSS_TOKENIZER_ENABLE_NORM="$(normalize_bool_flag "${OPD_CROSS_TOKENIZER_ENABLE:-0}" "OPD_CROSS_TOKENIZER_ENABLE")"
+if [[ "${OPD_CROSS_TOKENIZER_ENABLE_NORM}" == "1" ]]; then
+  if path_uses_qwen35_converted_vocab "${STUDENT_HF_CHECKPOINT_PATH}"; then
+    echo "Invalid cross-tokenizer config: STUDENT_HF_CHECKPOINT='${STUDENT_HF_CHECKPOINT_PATH}'" >&2
+    echo "Cross-tokenizer distillation must use native Qwen3 checkpoints (no '*-As-Qwen35*')." >&2
+    exit 1
+  fi
+  if path_uses_qwen35_converted_vocab "${STUDENT_REF_LOAD_PATH}"; then
+    echo "Invalid cross-tokenizer config: STUDENT_REF_LOAD='${STUDENT_REF_LOAD_PATH}'" >&2
+    echo "Cross-tokenizer distillation must use native Qwen3 checkpoints (no '*-As-Qwen35*')." >&2
+    exit 1
+  fi
+  if [[ -n "${STUDENT_LOAD_PATH}" ]] && path_uses_qwen35_converted_vocab "${STUDENT_LOAD_PATH}"; then
+    echo "Invalid cross-tokenizer config: STUDENT_LOAD='${STUDENT_LOAD_PATH}'" >&2
+    echo "Cross-tokenizer distillation must use native Qwen3 checkpoints (no '*-As-Qwen35*')." >&2
+    exit 1
+  fi
+fi
+
 validate_hf_checkpoint_dir "${STUDENT_HF_CHECKPOINT_PATH}"
+
+setup_distill_mode
+if [[ "${OPD_CROSS_TOKENIZER_ENABLE}" == "1" && -z "${OPD_STUDENT_TOKENIZER_PATH}" ]]; then
+  OPD_STUDENT_TOKENIZER_PATH="${STUDENT_HF_CHECKPOINT_PATH%/}"
+  echo "Cross-tokenizer default: OPD_STUDENT_TOKENIZER_PATH=${OPD_STUDENT_TOKENIZER_PATH}"
+fi
+preflight_cross_tokenizer_vocab_match \
+  "${OPD_CROSS_TOKENIZER_ENABLE}" \
+  "${MODEL_CONFIG_REL}" \
+  "${STUDENT_HF_CHECKPOINT_PATH}" \
+  MODEL_ARGS
 
 ENSURE_REF_MODEL_SCRIPT="${SCRIPT_DIR}/ensure_ref_model.sh"
 require_file "${ENSURE_REF_MODEL_SCRIPT}" "Missing ref model helper script"
@@ -200,8 +237,6 @@ require_positive_int "${TEACHER_HEALTH_RETRY_SEC}" "TEACHER_HEALTH_RETRY_SEC"
 
 wait_http_healthy "${TEACHER_BASE}/health_generate" "health_generate" "${TEACHER_HEALTH_MAX_ATTEMPTS}" "${TEACHER_HEALTH_RETRY_SEC}"
 wait_http_healthy "${TEACHER_BASE}/get_model_info" "get_model_info" "${TEACHER_HEALTH_MAX_ATTEMPTS}" "${TEACHER_HEALTH_RETRY_SEC}"
-
-setup_distill_mode
 
 # Opinionated async layout for a 120-GPU cluster (15x8): 56 train (7 nodes) + 64 rollout (8 nodes).
 ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-7}"

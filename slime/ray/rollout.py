@@ -410,6 +410,10 @@ class RolloutManager:
             train_data["teacher_topk_logprobs"] = [sample.teacher_topk_logprobs for sample in samples]
         if samples[0].teacher_topk_token_ids is not None:
             train_data["teacher_topk_token_ids"] = [sample.teacher_topk_token_ids for sample in samples]
+        if samples[0].teacher_topk_group_lengths is not None:
+            train_data["teacher_topk_group_lengths"] = [sample.teacher_topk_group_lengths for sample in samples]
+        if samples[0].teacher_topk_group_valid_mask is not None:
+            train_data["teacher_topk_group_valid_mask"] = [sample.teacher_topk_group_valid_mask for sample in samples]
 
         return train_data
 
@@ -454,6 +458,8 @@ class RolloutManager:
                 "teacher_logprob_start_len",
                 "teacher_topk_logprobs",
                 "teacher_topk_token_ids",
+                "teacher_topk_group_lengths",
+                "teacher_topk_group_valid_mask",
             ]:
                 if key not in data:
                     continue

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from functools import lru_cache
+from typing import Any
 
 import aiohttp
 from aiohttp import ClientError
@@ -11,7 +13,7 @@ from transformers import AutoTokenizer
 
 from slime.utils.types import Sample
 
-from opd_topk_parser import extract_topk_from_reward
+from opd_topk_parser import TOPK_PAD_LOGPROB, TOPK_PAD_TOKEN_ID, extract_topk_from_reward
 
 _HTTP_SESSION: aiohttp.ClientSession | None = None
 _HTTP_SESSION_LOOP: asyncio.AbstractEventLoop | None = None
@@ -45,6 +47,10 @@ def _is_privileged_enabled(args) -> bool:
     return _normalize_bool(getattr(args, "opd_privileged_enable", False), default=False)
 
 
+def _is_cross_tokenizer_enabled(args) -> bool:
+    return _normalize_bool(getattr(args, "opd_cross_tokenizer_enable", False), default=False)
+
+
 def _stringify_privileged_value(value: object) -> str | None:
     if value is None:
         return None
@@ -73,7 +79,7 @@ def _resolve_privileged_context(args, sample: Sample) -> str | None:
     return None
 
 
-def _get_tokenizer_path(args) -> str:
+def _get_privileged_tokenizer_path(args) -> str:
     tokenizer_path = str(getattr(args, "opd_privileged_tokenizer_path", "") or "").strip()
     if tokenizer_path:
         return tokenizer_path
@@ -88,7 +94,32 @@ def _get_tokenizer_path(args) -> str:
     )
 
 
-@lru_cache(maxsize=4)
+def _get_teacher_tokenizer_path(args) -> str:
+    path = str(getattr(args, "opd_teacher_tokenizer_path", "") or "").strip()
+    if path:
+        return path
+    raise ValueError(
+        "Cannot resolve teacher tokenizer path for cross-tokenizer distillation. "
+        "Set `opd_teacher_tokenizer_path` in custom config."
+    )
+
+
+def _get_student_tokenizer_path(args) -> str:
+    path = str(getattr(args, "opd_student_tokenizer_path", "") or "").strip()
+    if path:
+        return path
+
+    hf_checkpoint = str(getattr(args, "hf_checkpoint", "") or "").strip()
+    if hf_checkpoint:
+        return hf_checkpoint
+
+    raise ValueError(
+        "Cannot resolve student tokenizer path for cross-tokenizer distillation. "
+        "Set `opd_student_tokenizer_path` in custom config or provide --hf-checkpoint."
+    )
+
+
+@lru_cache(maxsize=8)
 def _get_tokenizer(tokenizer_path: str):
     return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
@@ -203,7 +234,20 @@ async def _get_http_session(args) -> aiohttp.ClientSession:
     return _HTTP_SESSION
 
 
-def _build_teacher_input_ids_and_start_len(args, sample: Sample) -> tuple[list[int], int]:
+def _decode_ids(tokenizer, token_ids: list[int]) -> str:
+    if not token_ids:
+        return ""
+    return tokenizer.decode(token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+
+
+def _encode_privileged_suffix_ids(args, tokenizer, privileged_context: str) -> list[int]:
+    open_tag = _get_privileged_tag(args, "opd_privileged_open_tag", "[PRIVILEGED_CONTEXT]")
+    close_tag = _get_privileged_tag(args, "opd_privileged_close_tag", "[/PRIVILEGED_CONTEXT]")
+    suffix = f"\n{open_tag}\n{privileged_context}\n{close_tag}\n"
+    return [int(tid) for tid in tokenizer.encode(suffix, add_special_tokens=False)]
+
+
+def _build_teacher_input_ids_and_start_len_same_tokenizer(args, sample: Sample) -> tuple[list[int], int]:
     prompt_len = len(sample.tokens) - sample.response_length
     if prompt_len < 0:
         raise ValueError(
@@ -221,18 +265,55 @@ def _build_teacher_input_ids_and_start_len(args, sample: Sample) -> tuple[list[i
     if not _is_privileged_enabled(args):
         return prompt_ids + response_ids, len(prompt_ids)
 
-    privileged_context = _resolve_privileged_context(args, sample)
+    privileged_context = _resolve_privileged_context(args, sample=sample)
     if privileged_context is None:
         return prompt_ids + response_ids, len(prompt_ids)
 
-    open_tag = _get_privileged_tag(args, "opd_privileged_open_tag", "[PRIVILEGED_CONTEXT]")
-    close_tag = _get_privileged_tag(args, "opd_privileged_close_tag", "[/PRIVILEGED_CONTEXT]")
-    suffix = f"\n{open_tag}\n{privileged_context}\n{close_tag}\n"
+    tokenizer = _get_tokenizer(_get_privileged_tokenizer_path(args))
+    privileged_ids = _encode_privileged_suffix_ids(args, tokenizer, privileged_context)
 
-    tokenizer = _get_tokenizer(_get_tokenizer_path(args))
-    privileged_ids = [int(tid) for tid in tokenizer.encode(suffix, add_special_tokens=False)]
     scored_prompt_ids = prompt_ids + privileged_ids
     return scored_prompt_ids + response_ids, len(scored_prompt_ids)
+
+
+def _build_teacher_input_ids_and_start_len_cross_tokenizer(args, sample: Sample) -> tuple[list[int], int]:
+    prompt_len = len(sample.tokens) - sample.response_length
+    if prompt_len < 0:
+        raise ValueError(
+            f"Invalid sample lengths: len(tokens)={len(sample.tokens)} < response_length={sample.response_length}."
+        )
+
+    student_prompt_ids = list(sample.tokens[:prompt_len])
+    student_response_ids = list(sample.tokens[prompt_len:])
+    if len(student_response_ids) != sample.response_length:
+        raise ValueError(
+            "Response slicing mismatch: "
+            f"len(response_ids)={len(student_response_ids)} vs response_length={sample.response_length}."
+        )
+
+    student_tokenizer = _get_tokenizer(_get_student_tokenizer_path(args))
+    teacher_tokenizer = _get_tokenizer(_get_teacher_tokenizer_path(args))
+
+    prompt_text = _decode_ids(student_tokenizer, student_prompt_ids)
+    response_text = _decode_ids(student_tokenizer, student_response_ids)
+
+    teacher_prompt_ids = [int(tid) for tid in teacher_tokenizer.encode(prompt_text, add_special_tokens=False)]
+    teacher_response_ids = [int(tid) for tid in teacher_tokenizer.encode(response_text, add_special_tokens=False)]
+
+    privileged_ids: list[int] = []
+    if _is_privileged_enabled(args):
+        privileged_context = _resolve_privileged_context(args, sample=sample)
+        if privileged_context is not None:
+            privileged_ids = _encode_privileged_suffix_ids(args, teacher_tokenizer, privileged_context)
+
+    scored_prompt_ids = teacher_prompt_ids + privileged_ids
+    return scored_prompt_ids + teacher_response_ids, len(scored_prompt_ids)
+
+
+def _build_teacher_input_ids_and_start_len(args, sample: Sample) -> tuple[list[int], int]:
+    if _is_cross_tokenizer_enabled(args):
+        return _build_teacher_input_ids_and_start_len_cross_tokenizer(args, sample)
+    return _build_teacher_input_ids_and_start_len_same_tokenizer(args, sample)
 
 
 def _build_teacher_payload(args, sample: Sample, topk: int) -> dict:
@@ -298,18 +379,389 @@ async def reward_func_topk(args, sample: Sample, **kwargs):
     raise RuntimeError("Teacher request failed without exception details.")
 
 
+def _extract_required_meta_info(reward: dict[str, Any]) -> dict[str, Any]:
+    meta_info = reward.get("meta_info")
+    if not isinstance(meta_info, dict):
+        raise ValueError("reward payload missing dict field: meta_info")
+    return meta_info
+
+
+def _extract_input_top_logprobs_rows_with_text(
+    reward: dict[str, Any],
+    *,
+    response_length: int,
+    topk: int,
+) -> list[list[tuple[float, int, str | None]]]:
+    if response_length < 0:
+        raise ValueError(f"response_length must be >= 0, got {response_length}.")
+    if topk <= 0:
+        raise ValueError(f"topk must be > 0, got {topk}.")
+
+    meta_info = _extract_required_meta_info(reward)
+    rows = meta_info.get("input_top_logprobs")
+    if not isinstance(rows, list):
+        raise ValueError(f"meta_info.input_top_logprobs must be a list, got {type(rows)}.")
+    if len(rows) < response_length:
+        raise ValueError(
+            "input_top_logprobs shorter than response span: "
+            f"rows={len(rows)}, response_length={response_length}."
+        )
+
+    selected_rows = rows[-response_length:] if response_length > 0 else []
+    parsed: list[list[tuple[float, int, str | None]]] = []
+    for row_idx, row in enumerate(selected_rows):
+        if row is None:
+            entries = []
+        elif isinstance(row, list):
+            entries = row
+        else:
+            raise ValueError(f"input_top_logprobs[{row_idx}] must be a list or None, got {type(row)}.")
+
+        parsed_row: list[tuple[float, int, str | None]] = []
+        for col_idx, entry in enumerate(entries[:topk]):
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                raise ValueError(
+                    "input_top_logprobs row entry must be [logprob, token_id, ...], "
+                    f"got {entry!r} at row={row_idx}, col={col_idx}."
+                )
+
+            logprob = entry[0]
+            token_id = entry[1]
+            token_text = entry[2] if len(entry) > 2 else None
+
+            if isinstance(logprob, bool) or not isinstance(logprob, (int, float)):
+                raise ValueError(
+                    f"logprob must be numeric, got {type(logprob)} at row={row_idx}, col={col_idx}."
+                )
+            if isinstance(token_id, bool) or not isinstance(token_id, int):
+                raise ValueError(
+                    f"token_id must be int, got {type(token_id)} at row={row_idx}, col={col_idx}."
+                )
+            if token_text is not None and not isinstance(token_text, str):
+                token_text = None
+
+            parsed_row.append((float(logprob), int(token_id), token_text))
+        parsed.append(parsed_row)
+
+    return parsed
+
+
+def _extract_input_token_logprob_rows(
+    reward: dict[str, Any],
+    *,
+    response_length: int,
+) -> list[tuple[float, int, str | None]]:
+    if response_length < 0:
+        raise ValueError(f"response_length must be >= 0, got {response_length}.")
+
+    meta_info = _extract_required_meta_info(reward)
+    rows = meta_info.get("input_token_logprobs")
+    if not isinstance(rows, list):
+        raise ValueError(f"meta_info.input_token_logprobs must be a list, got {type(rows)}.")
+    if len(rows) < response_length:
+        raise ValueError(
+            "input_token_logprobs shorter than response span: "
+            f"rows={len(rows)}, response_length={response_length}."
+        )
+
+    selected_rows = rows[-response_length:] if response_length > 0 else []
+    parsed: list[tuple[float, int, str | None]] = []
+    for row_idx, row in enumerate(selected_rows):
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            raise ValueError(
+                f"input_token_logprobs[{row_idx}] must be [logprob, token_id, ...], got {row!r}."
+            )
+
+        logprob = row[0]
+        token_id = row[1]
+        token_text = row[2] if len(row) > 2 else None
+        if isinstance(logprob, bool) or not isinstance(logprob, (int, float)):
+            raise ValueError(f"input_token_logprobs[{row_idx}] logprob must be numeric, got {type(logprob)}.")
+        if isinstance(token_id, bool) or not isinstance(token_id, int):
+            raise ValueError(f"input_token_logprobs[{row_idx}] token_id must be int, got {type(token_id)}.")
+        if token_text is not None and not isinstance(token_text, str):
+            token_text = None
+
+        parsed.append((float(logprob), int(token_id), token_text))
+
+    return parsed
+
+
+def _to_canonical_pieces(tokenizer, token_ids: list[int]) -> list[str]:
+    pieces: list[str] = []
+    prev = ""
+    for idx in range(len(token_ids)):
+        cur = tokenizer.decode(token_ids[: idx + 1], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        if cur.startswith(prev):
+            piece = cur[len(prev) :]
+        else:
+            piece = tokenizer.decode([token_ids[idx]], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        pieces.append(piece)
+        prev = cur
+    return pieces
+
+
+def _build_alignment_groups(
+    student_tokenizer,
+    teacher_tokenizer,
+    student_token_ids: list[int],
+    teacher_token_ids: list[int],
+) -> tuple[list[list[int]], list[list[int]], bool]:
+    s_pieces = _to_canonical_pieces(student_tokenizer, student_token_ids)
+    t_pieces = _to_canonical_pieces(teacher_tokenizer, teacher_token_ids)
+
+    i = 0
+    j = 0
+    s_buf = ""
+    t_buf = ""
+    s_group: list[int] = []
+    t_group: list[int] = []
+    s_groups: list[list[int]] = []
+    t_groups: list[list[int]] = []
+    clean = True
+
+    def flush_groups() -> None:
+        nonlocal s_group, t_group
+        if s_group and t_group:
+            s_groups.append(s_group.copy())
+            t_groups.append(t_group.copy())
+        else:
+            nonlocal clean
+            clean = False
+        s_group = []
+        t_group = []
+
+    while i < len(s_pieces) or j < len(t_pieces):
+        if s_buf == t_buf and s_buf != "":
+            flush_groups()
+            s_buf = ""
+            t_buf = ""
+            continue
+
+        if s_buf == "" and i < len(s_pieces):
+            s_buf += s_pieces[i]
+            s_group.append(i)
+            i += 1
+            continue
+        if t_buf == "" and j < len(t_pieces):
+            t_buf += t_pieces[j]
+            t_group.append(j)
+            j += 1
+            continue
+
+        if len(s_buf) <= len(t_buf):
+            if i < len(s_pieces):
+                s_buf += s_pieces[i]
+                s_group.append(i)
+                i += 1
+            elif j < len(t_pieces):
+                t_buf += t_pieces[j]
+                t_group.append(j)
+                j += 1
+            else:
+                break
+        else:
+            if j < len(t_pieces):
+                t_buf += t_pieces[j]
+                t_group.append(j)
+                j += 1
+            elif i < len(s_pieces):
+                s_buf += s_pieces[i]
+                s_group.append(i)
+                i += 1
+            else:
+                break
+
+    if s_buf == t_buf and s_buf != "":
+        flush_groups()
+    elif s_group or t_group:
+        clean = False
+
+    if i != len(s_pieces) or j != len(t_pieces):
+        clean = False
+
+    return s_groups, t_groups, clean
+
+
+def _build_fallback_alignment_groups(
+    student_length: int,
+    teacher_length: int,
+) -> tuple[list[list[int]], list[list[int]]]:
+    s_groups: list[list[int]] = []
+    t_groups: list[list[int]] = []
+    common = min(student_length, teacher_length)
+
+    for idx in range(common):
+        s_groups.append([idx])
+        t_groups.append([idx])
+
+    for idx in range(common, student_length):
+        s_groups.append([idx])
+        t_groups.append([])
+
+    return s_groups, t_groups
+
+
+def _logsumexp_pair(a: float, b: float) -> float:
+    m = max(a, b)
+    return m + math.log(math.exp(a - m) + math.exp(b - m))
+
+
+def _extract_teacher_response_ids_from_reward(reward: dict[str, Any]) -> list[int]:
+    teacher_input_ids = reward.get("_opd_teacher_input_ids")
+    teacher_logprob_start_len = reward.get("_opd_teacher_logprob_start_len")
+    if not isinstance(teacher_input_ids, list):
+        raise ValueError("reward payload missing list field: _opd_teacher_input_ids")
+    if teacher_logprob_start_len is None:
+        raise ValueError("reward payload missing field: _opd_teacher_logprob_start_len")
+
+    start = int(teacher_logprob_start_len)
+    if start < 0 or start > len(teacher_input_ids):
+        raise ValueError(
+            "Invalid _opd_teacher_logprob_start_len: "
+            f"{start}, len(input_ids)={len(teacher_input_ids)}"
+        )
+
+    return [int(x) for x in teacher_input_ids[start:]]
+
+
+def _build_cross_tokenizer_teacher_targets(
+    args,
+    sample: Sample,
+    reward: dict[str, Any],
+    *,
+    topk: int,
+) -> tuple[list[list[float]], list[list[int]], list[int], list[int]]:
+    student_response_ids = [int(x) for x in sample.tokens[-sample.response_length :]] if sample.response_length > 0 else []
+    student_length = len(student_response_ids)
+
+    teacher_response_ids = _extract_teacher_response_ids_from_reward(reward)
+    teacher_length = len(teacher_response_ids)
+
+    teacher_top_rows = _extract_input_top_logprobs_rows_with_text(
+        reward,
+        response_length=teacher_length,
+        topk=topk,
+    )
+    teacher_token_rows = _extract_input_token_logprob_rows(
+        reward,
+        response_length=teacher_length,
+    )
+
+    student_tokenizer = _get_tokenizer(_get_student_tokenizer_path(args))
+    teacher_tokenizer = _get_tokenizer(_get_teacher_tokenizer_path(args))
+
+    s_groups, t_groups, clean = _build_alignment_groups(
+        student_tokenizer,
+        teacher_tokenizer,
+        student_response_ids,
+        teacher_response_ids,
+    )
+    if not clean:
+        s_groups, t_groups = _build_fallback_alignment_groups(student_length=student_length, teacher_length=teacher_length)
+
+    topk_logprobs = [[TOPK_PAD_LOGPROB] * topk for _ in range(student_length)]
+    topk_token_ids = [[TOPK_PAD_TOKEN_ID] * topk for _ in range(student_length)]
+    group_lengths = [0] * student_length
+    group_valid_mask = [0] * student_length
+
+    for s_group, t_group in zip(s_groups, t_groups, strict=True):
+        if not s_group:
+            continue
+
+        s_anchor = int(s_group[0])
+        if s_anchor < 0 or s_anchor >= student_length:
+            continue
+
+        s_group_len = int(len(s_group))
+        group_lengths[s_anchor] = s_group_len
+
+        if not t_group:
+            continue
+
+        t_anchor = int(t_group[0])
+        if t_anchor < 0 or t_anchor >= teacher_length:
+            continue
+
+        continuation_logprob = 0.0
+        valid_continuation = True
+        for pos in t_group[1:]:
+            if pos < 0 or pos >= teacher_length:
+                valid_continuation = False
+                break
+            continuation_logprob += float(teacher_token_rows[pos][0])
+        if not valid_continuation:
+            continue
+
+        row_entries = teacher_top_rows[t_anchor]
+        merged_by_student_id: dict[int, float] = {}
+        for logprob, token_id, token_text in row_entries:
+            token_surface = token_text
+            if token_surface is None:
+                token_surface = teacher_tokenizer.decode(
+                    [int(token_id)],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+
+            student_ids = student_tokenizer.encode(token_surface, add_special_tokens=False)
+            if len(student_ids) != 1:
+                continue
+
+            sid = int(student_ids[0])
+            merged_logprob = float(logprob) + continuation_logprob
+            prev = merged_by_student_id.get(sid)
+            if prev is None:
+                merged_by_student_id[sid] = merged_logprob
+            else:
+                merged_by_student_id[sid] = _logsumexp_pair(prev, merged_logprob)
+
+        if not merged_by_student_id:
+            continue
+
+        sorted_candidates = sorted(merged_by_student_id.items(), key=lambda x: x[1], reverse=True)[:topk]
+        for col, (sid, lp) in enumerate(sorted_candidates):
+            topk_token_ids[s_anchor][col] = int(sid)
+            topk_logprobs[s_anchor][col] = float(lp)
+
+        group_valid_mask[s_anchor] = 1
+
+    return topk_logprobs, topk_token_ids, group_lengths, group_valid_mask
+
+
 def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
     """Extract fixed-size teacher top-k tensors and attach to each sample."""
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     response_lengths = [sample.response_length for sample in samples]
     topk = _get_topk(args)
+    cross_tokenizer = _is_cross_tokenizer_enabled(args)
 
     for sample, reward, response_length in zip(samples, raw_rewards, response_lengths, strict=False):
-        topk_logprobs, topk_token_ids = extract_topk_from_reward(
-            reward,
-            response_length=response_length,
-            topk=topk,
-        )
+        if cross_tokenizer:
+            if not isinstance(reward, dict):
+                raise ValueError(f"reward payload must be a dict in cross-tokenizer mode, got {type(reward)}.")
+            topk_logprobs, topk_token_ids, group_lengths, group_valid_mask = _build_cross_tokenizer_teacher_targets(
+                args,
+                sample,
+                reward,
+                topk=topk,
+            )
+            if len(topk_logprobs) != response_length:
+                raise ValueError(
+                    "Cross-tokenizer top-k length mismatch: "
+                    f"len(topk_logprobs)={len(topk_logprobs)} vs response_length={response_length}."
+                )
+            sample.teacher_topk_group_lengths = group_lengths
+            sample.teacher_topk_group_valid_mask = group_valid_mask
+        else:
+            topk_logprobs, topk_token_ids = extract_topk_from_reward(
+                reward,
+                response_length=response_length,
+                topk=topk,
+            )
+            sample.teacher_topk_group_lengths = None
+            sample.teacher_topk_group_valid_mask = None
+
         sample.teacher_topk_logprobs = topk_logprobs
         sample.teacher_topk_token_ids = topk_token_ids
         if isinstance(reward, dict):

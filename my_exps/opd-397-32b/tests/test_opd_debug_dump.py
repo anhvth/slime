@@ -30,6 +30,10 @@ def _make_args(tmp_path: Path, rollout_id: int) -> Namespace:
         opd_mixed_kl_weight=0.5,
         opd_jsd_beta=0.5,
         opd_kl_coef=1.0,
+        opd_cross_tokenizer_enable=0,
+        opd_teacher_tokenizer_path="",
+        opd_student_tokenizer_path="",
+        hf_checkpoint="",
     )
 
 
@@ -93,6 +97,26 @@ def test_topk_subsample_is_deterministic(monkeypatch, tmp_path: Path) -> None:
     assert kept_a == kept_b
 
 
+def test_topk_logging_caps_samples_and_keeps_all_positions(monkeypatch, tmp_path: Path) -> None:
+    debug_dump.clear_debug_dump_cache()
+    monkeypatch.setattr(debug_dump, "_is_global_writer_rank", lambda: True)
+
+    args = _make_args(tmp_path, rollout_id=9)
+    args.opd_debug_dump_max_samples_per_update = 99
+    args.opd_debug_dump_max_positions_per_sample = 0
+    records = _make_topk_records(20, response_len=12, topk=5)
+
+    path = debug_dump.dump_topk_debug_update(args, mode="fkl", records=records)
+    assert path is not None
+
+    payload = torch.load(path, weights_only=False)
+    assert payload["num_records_kept"] == 8
+    assert payload["limits"]["max_samples_per_update"] == 8
+    assert payload["limits"]["max_positions_per_sample"] == 0
+    for record in payload["records"]:
+        assert record["position_indices"].numel() == record["response_length"]
+
+
 def test_retention_keeps_recent_files(monkeypatch, tmp_path: Path) -> None:
     debug_dump.clear_debug_dump_cache()
     monkeypatch.setattr(debug_dump, "_is_global_writer_rank", lambda: True)
@@ -148,3 +172,47 @@ def test_rkl_dump_contains_recomputable_reverse_kl(monkeypatch, tmp_path: Path) 
     assert record["teacher_input_ids"].tolist() == [101, 102, 103, 10, 11]
     recomputed = record["student_log_probs"] - record["teacher_log_probs"]
     assert torch.allclose(recomputed, record["reverse_kl"], atol=1e-6, rtol=1e-6)
+
+
+def test_cross_tokenizer_topk_dump_uses_teacher_anchor_positions(monkeypatch, tmp_path: Path) -> None:
+    debug_dump.clear_debug_dump_cache()
+    monkeypatch.setattr(debug_dump, "_is_global_writer_rank", lambda: True)
+    args = _make_args(tmp_path, rollout_id=9)
+    args.opd_debug_dump_max_positions_per_sample = 0
+    args.opd_cross_tokenizer_enable = 1
+    args.opd_teacher_tokenizer_path = "/teacher-tokenizer"
+    args.opd_student_tokenizer_path = "/student-tokenizer"
+
+    records = _make_topk_records(1, response_len=6, topk=3)
+    records[0]["cross_tokenizer"] = 1
+    records[0]["teacher_topk_group_lengths"] = torch.tensor([2, 0, 1, 0, 2, 0], dtype=torch.long)
+    records[0]["teacher_topk_group_valid_mask"] = torch.tensor([1, 0, 1, 0, 0, 0], dtype=torch.long)
+
+    path = debug_dump.dump_topk_debug_update(args, mode="fkl", records=records)
+    assert path is not None
+
+    payload = torch.load(path, weights_only=False)
+    assert payload["recipe"]["opd_cross_tokenizer_enable"] == 1
+    assert payload["recipe"]["opd_teacher_tokenizer_path"] == "/teacher-tokenizer"
+    assert payload["recipe"]["opd_student_tokenizer_path"] == "/student-tokenizer"
+    assert payload["recipe"]["opd_teacher_tokenizer_path_effective"] == "/teacher-tokenizer"
+    assert payload["recipe"]["opd_student_tokenizer_path_effective"] == "/student-tokenizer"
+
+    record = payload["records"][0]
+    assert record["cross_tokenizer"] == 1
+    assert record["position_unit"] == "teacher_group_anchor"
+    assert record["position_indices"].tolist() == [0, 2, 4]
+    assert record["teacher_topk_group_lengths"].tolist() == [2, 1, 2]
+    assert record["teacher_topk_group_valid_mask"].tolist() == [1, 1, 0]
+
+
+def test_recipe_effective_tokenizer_paths_fallback_to_hf_checkpoint(tmp_path: Path) -> None:
+    args = _make_args(tmp_path, rollout_id=1)
+    args.hf_checkpoint = "/models/qwen3-native"
+    args.opd_student_tokenizer_path = ""
+    args.opd_teacher_tokenizer_path = ""
+
+    recipe = debug_dump._build_recipe(args, mode="fkl")
+    assert recipe["hf_checkpoint"] == "/models/qwen3-native"
+    assert recipe["opd_student_tokenizer_path_effective"] == "/models/qwen3-native"
+    assert recipe["opd_teacher_tokenizer_path_effective"] == "/models/qwen3-native"
