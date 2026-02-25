@@ -250,3 +250,217 @@ def test_post_process_rewards_topk_sets_group_fields_for_cross_mode(monkeypatch)
     assert sample.teacher_topk_group_lengths == [1]
     assert sample.teacher_topk_group_valid_mask == [1]
     assert sample.teacher_topk_token_ids == [[111]]
+
+
+def test_cross_tokenizer_accepts_none_anchor_logprob_without_crashing(monkeypatch) -> None:
+    student_tok = _DummyTokenizer(
+        encode_map={"P": [10], "A": [111]},
+        decode_map={10: "P", 111: "A"},
+    )
+    teacher_tok = _DummyTokenizer(
+        encode_map={"P": [301], "A": [201]},
+        decode_map={301: "P", 201: "A"},
+    )
+
+    monkeypatch.setattr(
+        reward_plugin,
+        "_get_tokenizer",
+        lambda path: student_tok if path == "student" else teacher_tok,
+    )
+
+    args = _make_args(opd_top_logprobs_num=1)
+    sample = SimpleNamespace(tokens=[10, 111], response_length=1, metadata={}, label=None)
+    reward = {
+        "meta_info": {
+            "input_top_logprobs": [
+                [[-0.2, 901, "A"]],
+            ],
+            "input_token_logprobs": [
+                [None, 201, "A"],
+            ],
+        },
+        "_opd_teacher_input_ids": [301, 201],
+        "_opd_teacher_logprob_start_len": 1,
+    }
+
+    topk_logprobs, topk_token_ids, group_lengths, group_valid_mask = reward_plugin._build_cross_tokenizer_teacher_targets(
+        args,
+        sample,
+        reward,
+        topk=1,
+    )
+
+    assert group_lengths == [1]
+    assert group_valid_mask == [1]
+    assert topk_token_ids == [[111]]
+    assert topk_logprobs[0][0] == pytest.approx(-0.2, abs=1e-6)
+
+
+def test_cross_tokenizer_skips_group_when_continuation_logprob_is_none(monkeypatch) -> None:
+    student_tok = _DummyTokenizer(
+        encode_map={"P": [10], "AB": [111]},
+        decode_map={10: "P", 111: "AB"},
+    )
+    teacher_tok = _DummyTokenizer(
+        encode_map={"P": [301], "AB": [201, 202]},
+        decode_map={301: "P", 201: "A", 202: "B"},
+    )
+
+    monkeypatch.setattr(
+        reward_plugin,
+        "_get_tokenizer",
+        lambda path: student_tok if path == "student" else teacher_tok,
+    )
+
+    args = _make_args(opd_top_logprobs_num=2)
+    sample = SimpleNamespace(tokens=[10, 111], response_length=1, metadata={}, label=None)
+    reward = {
+        "meta_info": {
+            "input_top_logprobs": [
+                [[-0.2, 901, "AB"]],
+                [[-0.8, 902, "B"]],
+            ],
+            "input_token_logprobs": [
+                [-0.3, 201, "A"],
+                [None, 202, "B"],
+            ],
+        },
+        "_opd_teacher_input_ids": [301, 201, 202],
+        "_opd_teacher_logprob_start_len": 1,
+    }
+
+    topk_logprobs, topk_token_ids, group_lengths, group_valid_mask = reward_plugin._build_cross_tokenizer_teacher_targets(
+        args,
+        sample,
+        reward,
+        topk=2,
+    )
+
+    assert group_lengths == [1]
+    assert group_valid_mask == [0]
+    assert topk_token_ids == [[TOPK_PAD_TOKEN_ID, TOPK_PAD_TOKEN_ID]]
+    assert topk_logprobs == [[TOPK_PAD_LOGPROB, TOPK_PAD_LOGPROB]]
+
+
+def test_cross_tokenizer_build_targets_populates_timing_stats(monkeypatch) -> None:
+    student_tok = _DummyTokenizer(
+        encode_map={"P": [10], "A": [111]},
+        decode_map={10: "P", 111: "A"},
+    )
+    teacher_tok = _DummyTokenizer(
+        encode_map={"P": [301], "A": [201]},
+        decode_map={301: "P", 201: "A"},
+    )
+
+    monkeypatch.setattr(
+        reward_plugin,
+        "_get_tokenizer",
+        lambda path: student_tok if path == "student" else teacher_tok,
+    )
+
+    args = _make_args(opd_top_logprobs_num=1)
+    sample = SimpleNamespace(tokens=[10, 111], response_length=1, metadata={}, label=None)
+    reward = {
+        "meta_info": {
+            "input_top_logprobs": [
+                [[-0.2, 901, "A"]],
+            ],
+            "input_token_logprobs": [
+                [-0.3, 201, "A"],
+            ],
+        },
+        "_opd_teacher_input_ids": [301, 201],
+        "_opd_teacher_logprob_start_len": 1,
+    }
+
+    timing_stats: dict[str, float] = {}
+    reward_plugin._build_cross_tokenizer_teacher_targets(
+        args,
+        sample,
+        reward,
+        topk=1,
+        timing_stats=timing_stats,
+    )
+
+    expected_keys = {
+        "extract_rows_time_s",
+        "build_alignment_groups_time_s",
+        "project_teacher_support_time_s",
+        "total_time_s",
+        "fallback_used",
+    }
+    assert expected_keys.issubset(timing_stats.keys())
+    for key in ("extract_rows_time_s", "build_alignment_groups_time_s", "project_teacher_support_time_s", "total_time_s"):
+        assert math.isfinite(timing_stats[key])
+        assert timing_stats[key] >= 0.0
+    assert timing_stats["fallback_used"] in {0.0, 1.0}
+
+
+def test_post_process_rewards_topk_returns_alignment_metrics_in_cross_mode(monkeypatch) -> None:
+    student_tok = _DummyTokenizer(
+        encode_map={"A": [111]},
+        decode_map={10: "P", 111: "A"},
+    )
+    teacher_tok = _DummyTokenizer(
+        encode_map={"P": [301], "A": [201]},
+        decode_map={301: "P", 201: "A"},
+    )
+
+    monkeypatch.setattr(
+        reward_plugin,
+        "_get_tokenizer",
+        lambda path: student_tok if path == "student" else teacher_tok,
+    )
+
+    reward = {
+        "meta_info": {
+            "input_top_logprobs": [
+                [[-0.1, 901, "A"]],
+            ],
+            "input_token_logprobs": [
+                [-0.3, 201, "A"],
+            ],
+        },
+        "_opd_teacher_input_ids": [301, 201],
+        "_opd_teacher_logprob_start_len": 1,
+    }
+    sample = SimpleNamespace(
+        tokens=[10, 111],
+        response_length=1,
+        metadata={},
+        label=None,
+        teacher_topk_logprobs=None,
+        teacher_topk_token_ids=None,
+        teacher_topk_group_lengths=None,
+        teacher_topk_group_valid_mask=None,
+        teacher_input_ids=None,
+        teacher_logprob_start_len=None,
+    )
+    sample.get_reward_value = lambda _args: reward
+
+    args = _make_args(opd_top_logprobs_num=1)
+    raw_rewards, rewards, metrics = reward_plugin.post_process_rewards_topk(args, [sample])
+
+    assert raw_rewards == [0.0]
+    assert rewards == [0.0]
+    assert metrics["perf/opd_alignment/sample_count"] == pytest.approx(1.0, abs=1e-6)
+    required_metric_keys = [
+        "perf/opd_alignment/total_time_s/mean",
+        "perf/opd_alignment/total_time_s/median",
+        "perf/opd_alignment/total_time_s/max",
+        "perf/opd_alignment/total_time_s/min",
+        "perf/opd_alignment/build_groups_time_s/mean",
+        "perf/opd_alignment/build_groups_time_s/median",
+        "perf/opd_alignment/build_groups_time_s/max",
+        "perf/opd_alignment/build_groups_time_s/min",
+        "perf/opd_alignment/project_support_time_s/mean",
+        "perf/opd_alignment/project_support_time_s/median",
+        "perf/opd_alignment/project_support_time_s/max",
+        "perf/opd_alignment/project_support_time_s/min",
+        "perf/opd_alignment/fallback_ratio",
+    ]
+    for key in required_metric_keys:
+        assert key in metrics
+        assert math.isfinite(metrics[key])
+        assert metrics[key] >= 0.0
+    assert metrics["perf/opd_alignment/fallback_ratio"] <= 1.0

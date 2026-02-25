@@ -61,6 +61,7 @@ class RolloutManager:
         self.custom_reward_post_process_func = None
         if self.args.custom_reward_post_process_path is not None:
             self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
+        self._latest_custom_reward_post_process_metrics: dict[str, Any] = {}
         self.custom_convert_samples_to_train_data_func = None
         if self.args.custom_convert_samples_to_train_data_path is not None:
             self.custom_convert_samples_to_train_data_func = load_function(
@@ -148,7 +149,14 @@ class RolloutManager:
             raise
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        self._latest_custom_reward_post_process_metrics = {}
+        reward_postprocess_start_time = time.perf_counter()
         data = self._convert_samples_to_train_data(data)
+        reward_postprocess_total_time_s = time.perf_counter() - reward_postprocess_start_time
+        post_process_log_dict = {"perf/reward_postprocess_total_time_s": reward_postprocess_total_time_s}
+        post_process_log_dict.update(self._latest_custom_reward_post_process_metrics)
+        post_process_log_dict["rollout/step"] = compute_rollout_step(self.args, rollout_id)
+        logging_utils.log(self.args, post_process_log_dict, step_key="rollout/step")
         return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
 
     def eval(self, rollout_id):
@@ -314,8 +322,32 @@ class RolloutManager:
             torch.save(dict(rollout_id=rollout_id, **dump_data), path)
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
+        self._latest_custom_reward_post_process_metrics = {}
         if self.custom_reward_post_process_func is not None:
-            return self.custom_reward_post_process_func(self.args, samples)
+            custom_output = self.custom_reward_post_process_func(self.args, samples)
+            if not isinstance(custom_output, (tuple, list)):
+                raise ValueError(
+                    "Custom reward post-process function must return a tuple: "
+                    "(raw_rewards, rewards) or (raw_rewards, rewards, metrics_dict)."
+                )
+            if len(custom_output) == 2:
+                raw_rewards, rewards = custom_output
+                return raw_rewards, rewards
+            if len(custom_output) == 3:
+                raw_rewards, rewards, metrics = custom_output
+                if metrics is None:
+                    metrics = {}
+                if not isinstance(metrics, dict):
+                    raise ValueError(
+                        "Custom reward post-process function third return value must be a dict, "
+                        f"got {type(metrics)}."
+                    )
+                self._latest_custom_reward_post_process_metrics = dict(metrics)
+                return raw_rewards, rewards
+            raise ValueError(
+                "Custom reward post-process function must return either "
+                "(raw_rewards, rewards) or (raw_rewards, rewards, metrics_dict)."
+            )
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
         if (

@@ -151,6 +151,24 @@ def _get_int_option(args, name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _summarize_seconds(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"mean": 0.0, "median": 0.0, "max": 0.0, "min": 0.0}
+    sorted_values = sorted(float(v) for v in values)
+    value_count = len(sorted_values)
+    mid = value_count // 2
+    if value_count % 2 == 1:
+        median = sorted_values[mid]
+    else:
+        median = 0.5 * (sorted_values[mid - 1] + sorted_values[mid])
+    return {
+        "mean": sum(sorted_values) / value_count,
+        "median": median,
+        "max": sorted_values[-1],
+        "min": sorted_values[0],
+    }
+
+
 async def _close_http_session() -> None:
     global _HTTP_SESSION, _HTTP_SESSION_LOOP, _HTTP_SESSION_URL
     if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
@@ -450,7 +468,7 @@ def _extract_input_token_logprob_rows(
     reward: dict[str, Any],
     *,
     response_length: int,
-) -> list[tuple[float, int, str | None]]:
+) -> list[tuple[float | None, int, str | None]]:
     if response_length < 0:
         raise ValueError(f"response_length must be >= 0, got {response_length}.")
 
@@ -465,7 +483,7 @@ def _extract_input_token_logprob_rows(
         )
 
     selected_rows = rows[-response_length:] if response_length > 0 else []
-    parsed: list[tuple[float, int, str | None]] = []
+    parsed: list[tuple[float | None, int, str | None]] = []
     for row_idx, row in enumerate(selected_rows):
         if not isinstance(row, (list, tuple)) or len(row) < 2:
             raise ValueError(
@@ -475,14 +493,17 @@ def _extract_input_token_logprob_rows(
         logprob = row[0]
         token_id = row[1]
         token_text = row[2] if len(row) > 2 else None
-        if isinstance(logprob, bool) or not isinstance(logprob, (int, float)):
-            raise ValueError(f"input_token_logprobs[{row_idx}] logprob must be numeric, got {type(logprob)}.")
+        if logprob is not None and (isinstance(logprob, bool) or not isinstance(logprob, (int, float))):
+            raise ValueError(
+                "input_token_logprobs["
+                f"{row_idx}] logprob must be numeric or None, got {type(logprob)}."
+            )
         if isinstance(token_id, bool) or not isinstance(token_id, int):
             raise ValueError(f"input_token_logprobs[{row_idx}] token_id must be int, got {type(token_id)}.")
         if token_text is not None and not isinstance(token_text, str):
             token_text = None
 
-        parsed.append((float(logprob), int(token_id), token_text))
+        parsed.append((None if logprob is None else float(logprob), int(token_id), token_text))
 
     return parsed
 
@@ -631,7 +652,11 @@ def _build_cross_tokenizer_teacher_targets(
     reward: dict[str, Any],
     *,
     topk: int,
+    timing_stats: dict[str, float] | None = None,
 ) -> tuple[list[list[float]], list[list[int]], list[int], list[int]]:
+    total_start_time = time.perf_counter()
+
+    extract_rows_start_time = time.perf_counter()
     student_response_ids = [int(x) for x in sample.tokens[-sample.response_length :]] if sample.response_length > 0 else []
     student_length = len(student_response_ids)
 
@@ -647,7 +672,9 @@ def _build_cross_tokenizer_teacher_targets(
         reward,
         response_length=teacher_length,
     )
+    extract_rows_time_s = time.perf_counter() - extract_rows_start_time
 
+    build_groups_start_time = time.perf_counter()
     student_tokenizer = _get_tokenizer(_get_student_tokenizer_path(args))
     teacher_tokenizer = _get_tokenizer(_get_teacher_tokenizer_path(args))
 
@@ -657,14 +684,18 @@ def _build_cross_tokenizer_teacher_targets(
         student_response_ids,
         teacher_response_ids,
     )
+    fallback_used = 0
     if not clean:
         s_groups, t_groups = _build_fallback_alignment_groups(student_length=student_length, teacher_length=teacher_length)
+        fallback_used = 1
+    build_alignment_groups_time_s = time.perf_counter() - build_groups_start_time
 
     topk_logprobs = [[TOPK_PAD_LOGPROB] * topk for _ in range(student_length)]
     topk_token_ids = [[TOPK_PAD_TOKEN_ID] * topk for _ in range(student_length)]
     group_lengths = [0] * student_length
     group_valid_mask = [0] * student_length
 
+    project_support_start_time = time.perf_counter()
     for s_group, t_group in zip(s_groups, t_groups, strict=True):
         if not s_group:
             continue
@@ -689,7 +720,11 @@ def _build_cross_tokenizer_teacher_targets(
             if pos < 0 or pos >= teacher_length:
                 valid_continuation = False
                 break
-            continuation_logprob += float(teacher_token_rows[pos][0])
+            continuation_token_logprob = teacher_token_rows[pos][0]
+            if continuation_token_logprob is None:
+                valid_continuation = False
+                break
+            continuation_logprob += float(continuation_token_logprob)
         if not valid_continuation:
             continue
 
@@ -726,6 +761,19 @@ def _build_cross_tokenizer_teacher_targets(
 
         group_valid_mask[s_anchor] = 1
 
+    project_teacher_support_time_s = time.perf_counter() - project_support_start_time
+    total_time_s = time.perf_counter() - total_start_time
+    if timing_stats is not None:
+        timing_stats.update(
+            {
+                "extract_rows_time_s": extract_rows_time_s,
+                "build_alignment_groups_time_s": build_alignment_groups_time_s,
+                "project_teacher_support_time_s": project_teacher_support_time_s,
+                "total_time_s": total_time_s,
+                "fallback_used": float(fallback_used),
+            }
+        )
+
     return topk_logprobs, topk_token_ids, group_lengths, group_valid_mask
 
 
@@ -735,22 +783,32 @@ def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
     response_lengths = [sample.response_length for sample in samples]
     topk = _get_topk(args)
     cross_tokenizer = _is_cross_tokenizer_enabled(args)
+    alignment_total_times: list[float] = []
+    alignment_build_groups_times: list[float] = []
+    alignment_project_support_times: list[float] = []
+    alignment_fallback_flags: list[float] = []
 
     for sample, reward, response_length in zip(samples, raw_rewards, response_lengths, strict=False):
         if cross_tokenizer:
             if not isinstance(reward, dict):
                 raise ValueError(f"reward payload must be a dict in cross-tokenizer mode, got {type(reward)}.")
+            timing_stats: dict[str, float] = {}
             topk_logprobs, topk_token_ids, group_lengths, group_valid_mask = _build_cross_tokenizer_teacher_targets(
                 args,
                 sample,
                 reward,
                 topk=topk,
+                timing_stats=timing_stats,
             )
             if len(topk_logprobs) != response_length:
                 raise ValueError(
                     "Cross-tokenizer top-k length mismatch: "
                     f"len(topk_logprobs)={len(topk_logprobs)} vs response_length={response_length}."
                 )
+            alignment_total_times.append(float(timing_stats.get("total_time_s", 0.0)))
+            alignment_build_groups_times.append(float(timing_stats.get("build_alignment_groups_time_s", 0.0)))
+            alignment_project_support_times.append(float(timing_stats.get("project_teacher_support_time_s", 0.0)))
+            alignment_fallback_flags.append(float(timing_stats.get("fallback_used", 0.0)))
             sample.teacher_topk_group_lengths = group_lengths
             sample.teacher_topk_group_valid_mask = group_valid_mask
         else:
@@ -772,5 +830,29 @@ def post_process_rewards_topk(args, samples: list[Sample], **kwargs):
             if teacher_logprob_start_len is not None:
                 sample.teacher_logprob_start_len = int(teacher_logprob_start_len)
 
+    metrics_dict: dict[str, float] = {}
+    if cross_tokenizer:
+        total_stats = _summarize_seconds(alignment_total_times)
+        build_stats = _summarize_seconds(alignment_build_groups_times)
+        project_stats = _summarize_seconds(alignment_project_support_times)
+        sample_count = len(alignment_total_times)
+        fallback_ratio = (sum(alignment_fallback_flags) / sample_count) if sample_count > 0 else 0.0
+        metrics_dict = {
+            "perf/opd_alignment/total_time_s/mean": total_stats["mean"],
+            "perf/opd_alignment/total_time_s/median": total_stats["median"],
+            "perf/opd_alignment/total_time_s/max": total_stats["max"],
+            "perf/opd_alignment/total_time_s/min": total_stats["min"],
+            "perf/opd_alignment/build_groups_time_s/mean": build_stats["mean"],
+            "perf/opd_alignment/build_groups_time_s/median": build_stats["median"],
+            "perf/opd_alignment/build_groups_time_s/max": build_stats["max"],
+            "perf/opd_alignment/build_groups_time_s/min": build_stats["min"],
+            "perf/opd_alignment/project_support_time_s/mean": project_stats["mean"],
+            "perf/opd_alignment/project_support_time_s/median": project_stats["median"],
+            "perf/opd_alignment/project_support_time_s/max": project_stats["max"],
+            "perf/opd_alignment/project_support_time_s/min": project_stats["min"],
+            "perf/opd_alignment/fallback_ratio": fallback_ratio,
+            "perf/opd_alignment/sample_count": float(sample_count),
+        }
+
     scalar_rewards = [0.0] * len(samples)
-    return scalar_rewards, scalar_rewards
+    return scalar_rewards, scalar_rewards, metrics_dict

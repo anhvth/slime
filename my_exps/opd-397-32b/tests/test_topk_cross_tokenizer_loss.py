@@ -210,3 +210,93 @@ def test_distill_topk_cross_tokenizer_uses_per_sample_group_mean_reduction(monke
     assert logs["distill_kl"].item() == pytest.approx(3.0, rel=1e-6, abs=1e-6)
     assert logs["distill_kl_forward"].item() == pytest.approx(3.0, rel=1e-6, abs=1e-6)
     assert logs["distill_kl_reverse"].item() == pytest.approx(30.0, rel=1e-6, abs=1e-6)
+    for key in (
+        "distill_time_total_s",
+        "distill_time_student_gather_s",
+        "distill_time_cross_group_s",
+        "distill_time_debug_dump_s",
+    ):
+        assert key in logs
+        assert torch.isfinite(logs[key])
+        assert logs[key].item() >= 0.0
+
+
+def test_distill_topk_cross_tokenizer_empty_branch_keeps_timing_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = Namespace(
+        distill_loss_mode="fkl",
+        opd_mixed_kl_weight=0.5,
+        opd_jsd_beta=0.5,
+        opd_distill_coef=1.0,
+        opd_cross_tokenizer_enable=True,
+    )
+
+    batch = {
+        "teacher_topk_logprobs": [
+            torch.zeros((1, 2), dtype=torch.float32),
+        ],
+        "teacher_topk_token_ids": [
+            torch.zeros((1, 2), dtype=torch.long),
+        ],
+        "teacher_topk_group_lengths": [
+            torch.tensor([1], dtype=torch.long),
+        ],
+        "teacher_topk_group_valid_mask": [
+            torch.tensor([1], dtype=torch.long),
+        ],
+        "response_lengths": [1],
+        "total_lengths": [1],
+        "unconcat_tokens": [
+            torch.tensor([1], dtype=torch.long),
+        ],
+    }
+    logits = torch.zeros((1, 8), dtype=torch.float32)
+
+    monkeypatch.setattr(loss_plugin.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        loss_plugin,
+        "get_responses",
+        lambda *args, **kwargs: iter(
+            [
+                (torch.zeros((1, 8), dtype=torch.float32), None),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        loss_plugin,
+        "_gather_selected_logprobs_tp",
+        lambda logits_chunk, token_ids: torch.zeros(token_ids.shape, dtype=torch.float32, device=logits_chunk.device),
+    )
+    monkeypatch.setattr(
+        loss_plugin,
+        "compute_cross_tokenizer_group_losses",
+        lambda **kwargs: {
+            "forward": torch.empty((0,), dtype=torch.float32),
+            "reverse": torch.empty((0,), dtype=torch.float32),
+            "jsd": torch.empty((0,), dtype=torch.float32),
+            "forward_debug": torch.zeros((1,), dtype=torch.float32),
+            "reverse_debug": torch.zeros((1,), dtype=torch.float32),
+            "jsd_debug": torch.zeros((1,), dtype=torch.float32),
+            "valid_groups": 0,
+            "skipped_groups": 1,
+            "mapped_support": 0,
+            "total_support": 2,
+        },
+    )
+    monkeypatch.setattr(loss_plugin, "dump_topk_debug_update", None)
+
+    _, logs = loss_plugin.distill_topk_custom_loss(
+        args=args,
+        batch=batch,
+        logits=logits,
+        sum_of_sample_mean=lambda x: x.sum(),
+    )
+
+    for key in (
+        "distill_time_total_s",
+        "distill_time_student_gather_s",
+        "distill_time_cross_group_s",
+        "distill_time_debug_dump_s",
+    ):
+        assert key in logs
+        assert torch.isfinite(logs[key])
+        assert logs[key].item() >= 0.0

@@ -163,6 +163,32 @@ def test_input_top_logprobs_entry_types(sequence_case: dict[str, Any]) -> None:
     assert first_row[2] is None or isinstance(first_row[2], str)
 
 
+def test_input_token_logprobs_entry_types(sequence_case: dict[str, Any]) -> None:
+    full_ids = sequence_case["full_ids"]
+    prompt_len = len(sequence_case["prompt_ids"])
+
+    payload = {
+        "input_ids": full_ids,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 0,
+            "skip_special_tokens": False,
+        },
+        "return_logprob": True,
+        "logprob_start_len": prompt_len,
+        "top_logprobs_num": 16,
+    }
+    code, body = _post_generate(DEFAULT_BASE_URL, payload)
+    assert code == 200
+    rows = body.get("meta_info", {}).get("input_token_logprobs")
+    entry = _first_non_null(rows)
+    assert isinstance(entry, list)
+    assert len(entry) >= 3
+    assert entry[0] is None or isinstance(entry[0], (int, float))
+    assert isinstance(entry[1], int)
+    assert entry[2] is None or isinstance(entry[2], str)
+
+
 @pytest.mark.parametrize("k", [1, 8, 16, 32, 64])
 def test_topk_count_matches_requested_k(sequence_case: dict[str, Any], k: int) -> None:
     full_ids = sequence_case["full_ids"]

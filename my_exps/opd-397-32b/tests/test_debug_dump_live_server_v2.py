@@ -55,6 +55,7 @@ def test_build_record_payload_cross_tokenizer_teacher_units() -> None:
         {"logged_idx": 0, "student_anchor_idx": 0, "student_span_len": 2, "student_span_end": 2, "group_valid": 1},
         {"logged_idx": 1, "student_anchor_idx": 2, "student_span_len": 1, "student_span_end": 3, "group_valid": 0},
     ]
+    assert out["topk"]["token_id_space"] == "student"
     assert out["token_to_unit_map"] == {"0": 0, "1": 0, "2": 1}
     assert out["logged_position_map"] == {"0": 0, "1": 0, "2": 1}
 
@@ -286,6 +287,7 @@ def test_build_record_payload_legacy_dump_defaults_to_student_token_mode() -> No
     )
     assert out["position_unit"] == "student_token"
     assert out["teacher_units"] == []
+    assert out["topk"]["token_id_space"] == "shared"
     assert out["logged_position_map"]["1"] == 0
 
 

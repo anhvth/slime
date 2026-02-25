@@ -670,6 +670,7 @@ def _build_record_payload(
             "teacher_logprobs": teacher_lp.tolist(),
             "student_logprobs": student_lp.tolist(),
             "token_map": token_map,
+            "token_id_space": ("student" if cross_tokenizer else "shared"),
         }
         mass = {
             "teacher_top1_mass": teacher_top1_mass.tolist(),
@@ -1242,7 +1243,7 @@ def index() -> HTMLResponse:
       <thead>
         <tr>
           <th>Rank</th>
-          <th>Token ID</th>
+          <th id="topkTokenIdHeader">Token ID</th>
           <th>Token Text</th>
           <th>Teacher p</th>
           <th>Student p</th>
@@ -1277,6 +1278,7 @@ def index() -> HTMLResponse:
       tokenWarn: document.getElementById("tokenWarn"),
       massMeta: document.getElementById("massMeta"),
       topkTitle: document.getElementById("topkTitle"),
+      topkTokenIdHeader: document.getElementById("topkTokenIdHeader"),
       topkBody: document.getElementById("topkBody"),
       rklOnlyInfo: document.getElementById("rklOnlyInfo"),
     };
@@ -1643,6 +1645,17 @@ def index() -> HTMLResponse:
       return Number(arr[loggedIdx]);
     }
 
+    function resolveTopkTokenIdHeader(payload) {
+      if (!payload) return "Token ID";
+      const space = String(payload?.topk?.token_id_space || "").toLowerCase();
+      if (space === "student") return "Token ID (Student)";
+      if (space === "teacher") return "Token ID (Teacher)";
+      if (space === "shared" || space === "teacher_student_shared") return "Token ID (Teacher=Student)";
+      return Number(payload?.cross_tokenizer || 0) === 1
+        ? "Token ID (Student)"
+        : "Token ID (Teacher=Student)";
+    }
+
     function renderInspector() {
       els.topkBody.innerHTML = "";
       els.rklOnlyInfo.textContent = "";
@@ -1651,6 +1664,7 @@ def index() -> HTMLResponse:
 
       const p = state.record?.payload;
       if (!p) return;
+      els.topkTokenIdHeader.textContent = resolveTopkTokenIdHeader(p);
       const teacherMode = isTeacherUnitMode(p);
       let loggedIdx = state.selectedLoggedIdx;
       let inspectorTitle = "Top-k Next Token Distribution";

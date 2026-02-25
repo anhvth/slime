@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from argparse import Namespace
 
 import torch
@@ -290,6 +291,11 @@ def distill_topk_custom_loss(
     sum_of_sample_mean,
 ):
     """Custom loss for top-k distillation with FKL / mixed-KL / JSD."""
+    distill_total_start_time = time.perf_counter()
+    distill_time_student_gather_s = 0.0
+    distill_time_cross_group_s = 0.0
+    distill_time_debug_dump_s = 0.0
+
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size != 1:
         raise ValueError(
@@ -379,6 +385,7 @@ def distill_topk_custom_loss(
             group_lengths = teacher_topk_group_lengths[i].to(device=logits_chunk.device, dtype=torch.long)
             group_valid_mask = teacher_topk_group_valid_mask[i].to(device=logits_chunk.device, dtype=torch.long)
 
+            gather_start_time = time.perf_counter()
             student_anchor_lp = _gather_selected_logprobs_tp(logits_chunk, teacher_ids)
             student_debug_lp = student_anchor_lp
 
@@ -386,7 +393,9 @@ def distill_topk_custom_loss(
                 device=logits_chunk.device
             )
             student_actual_lp = _gather_selected_logprobs_tp(logits_chunk, response_token_ids.unsqueeze(-1)).squeeze(-1)
+            distill_time_student_gather_s += time.perf_counter() - gather_start_time
 
+            cross_group_start_time = time.perf_counter()
             group_res = compute_cross_tokenizer_group_losses(
                 teacher_log_probs=teacher_lp,
                 student_anchor_log_probs=student_anchor_lp,
@@ -397,6 +406,7 @@ def distill_topk_custom_loss(
                 mixed_weight=mixed_weight,
                 jsd_beta=jsd_beta,
             )
+            distill_time_cross_group_s += time.perf_counter() - cross_group_start_time
 
             forward_kl = group_res["forward"]
             reverse_kl = group_res["reverse"]
@@ -420,7 +430,9 @@ def distill_topk_custom_loss(
             reverse_debug = group_res["reverse_debug"]
             jsd_debug = group_res["jsd_debug"] if per_jsd is not None else None
         else:
+            gather_start_time = time.perf_counter()
             student_lp = _gather_selected_logprobs_tp(logits_chunk, teacher_ids)
+            distill_time_student_gather_s += time.perf_counter() - gather_start_time
             student_debug_lp = student_lp
             forward_kl, reverse_kl = _compute_forward_reverse_terms(teacher_lp, student_lp)
             jsd = compute_topk_renormalized_jsd(teacher_lp, student_lp, beta=jsd_beta) if per_jsd is not None else None
@@ -467,14 +479,18 @@ def distill_topk_custom_loss(
         debug_records.append(debug_record)
 
     if dump_topk_debug_update is not None and debug_records:
+        debug_dump_start_time = time.perf_counter()
         try:
             dump_topk_debug_update(args, mode=mode, records=debug_records)
         except Exception:
             logger.warning("Failed to save top-k distillation debug dump.", exc_info=True)
+        finally:
+            distill_time_debug_dump_s += time.perf_counter() - debug_dump_start_time
 
     if not per_forward:
         zero = 0.0 * logits.sum()
         empty_mode_code = {"fkl": 1.0, "mixed": 2.0, "jsd": 3.0}[mode]
+        distill_time_total_s = time.perf_counter() - distill_total_start_time
         return (
             zero,
             {
@@ -488,6 +504,10 @@ def distill_topk_custom_loss(
                 "distill_valid_groups": torch.tensor(0.0, device=logits.device),
                 "distill_skipped_groups": torch.tensor(float(skipped_groups_total), device=logits.device),
                 "distill_support_coverage": torch.tensor(0.0, device=logits.device),
+                "distill_time_total_s": torch.tensor(float(distill_time_total_s), device=logits.device),
+                "distill_time_student_gather_s": torch.tensor(float(distill_time_student_gather_s), device=logits.device),
+                "distill_time_cross_group_s": torch.tensor(float(distill_time_cross_group_s), device=logits.device),
+                "distill_time_debug_dump_s": torch.tensor(float(distill_time_debug_dump_s), device=logits.device),
             },
         )
 
@@ -548,6 +568,7 @@ def distill_topk_custom_loss(
         raise ValueError(f"Inconsistent top-k across samples in one micro-batch: {topk_values}")
 
     support_coverage = mapped_support_total / support_den_total if support_den_total > 0 else 0.0
+    distill_time_total_s = time.perf_counter() - distill_total_start_time
 
     return (
         loss,
@@ -562,5 +583,9 @@ def distill_topk_custom_loss(
             "distill_valid_groups": torch.tensor(float(valid_groups_total), device=logits.device),
             "distill_skipped_groups": torch.tensor(float(skipped_groups_total), device=logits.device),
             "distill_support_coverage": torch.tensor(float(support_coverage), device=logits.device),
+            "distill_time_total_s": torch.tensor(float(distill_time_total_s), device=logits.device),
+            "distill_time_student_gather_s": torch.tensor(float(distill_time_student_gather_s), device=logits.device),
+            "distill_time_cross_group_s": torch.tensor(float(distill_time_cross_group_s), device=logits.device),
+            "distill_time_debug_dump_s": torch.tensor(float(distill_time_debug_dump_s), device=logits.device),
         },
     )
